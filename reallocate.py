@@ -597,8 +597,21 @@ def process_event(event_df: pd.DataFrame, problematic: set) -> tuple:
 # ---------------------------------------------------------------------------
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description='Concert seat reallocator')
+    parser.add_argument(
+        '--full-report', metavar='PATH',
+        help='Path to the full-columns report CSV. When given, the output is '
+             'data/report_annotated.xlsx with every row annotated with '
+             'Nuovo posto and Stato. Without it, only moved/infeasible seats '
+             'are written to data/reallocation.xlsx.',
+    )
+    args = parser.parse_args()
+    full_report_path = args.full_report
+    tickets_path = full_report_path or 'data/report_cleaned.csv'
+
     print('Loading tickets...', flush=True)
-    tickets = load_tickets('data/report_cleaned.csv')
+    tickets = load_tickets(tickets_path)
     print(f'  {len(tickets):,} valid rows across {tickets["Data evento"].nunique()} events.', flush=True)
 
     print('Loading problematic orders...', flush=True)
@@ -628,38 +641,12 @@ def main():
         if infeasible:
             print(f'  Could not fix: {infeasible}', flush=True)
 
-    active        = tickets[tickets['Stato posto'].isin(OCCUPIED)]
+    active         = tickets[tickets['Stato posto'].isin(OCCUPIED)]
     infeasible_set = {(ed, oid) for ed, oid in all_infeasible}
 
-    # Build infeasible rows: one row per seat of each infeasible order
-    infeasible_rows: list = []
-    seen_inf: set = set()
-    for event_date, oid in all_infeasible:
-        if (event_date, oid) in seen_inf:
-            continue
-        seen_inf.add((event_date, oid))
-        order_seats = active[
-            (active['Data evento'] == event_date) &
-            (active['Codice ordine'] == oid)
-        ]
-        for _, row in order_seats.iterrows():
-            infeasible_rows.append({
-                'Data evento':     event_date,
-                'Codice ordine':   oid,
-                'Settore':         row['Settore'],
-                'Fila':            row['Fila'],
-                'Settore prezzi':  row['Settore prezzi'],
-                'Posto originale': row['Posto'],
-                'Posto nuovo':     row['Posto'],
-                'Stato':           'NON RISOLVIBILE',
-            })
-
-    # Detect collateral damage and build the collateral sheet.
-    # all_moves now includes every seat of each moved order (including unchanged
-    # seats), so we can reconstruct final positions by applying the moves.
+    # --- Collateral detection (shared by both output modes) ---
     collateral_rows: list = []
-
-    moves_by_event: dict = defaultdict(list)
+    moves_by_event: dict  = defaultdict(list)
     for m in all_moves:
         moves_by_event[m['Data evento']].append(m)
 
@@ -697,35 +684,157 @@ def main():
                 'Stato':           'COLLATERALE',
             })
 
-    cols = [
-        'Codice ordine', 'Settore', 'Fila', 'Settore prezzi',
-        'Posto originale', 'Posto nuovo', 'Stato',
-    ]
-    all_rows = all_moves + infeasible_rows
-    if all_rows:
-        df_all = pd.DataFrame(all_rows)
-        with pd.ExcelWriter('data/reallocation.xlsx', engine='openpyxl') as writer:
-            for event_date, group in df_all.groupby('Data evento'):
+    if full_report_path:
+        # ---------------------------------------------------------------
+        # Full-report mode: annotate every row of the big file
+        # ---------------------------------------------------------------
+        with open(full_report_path, 'r', encoding='utf-8-sig') as f:
+            first_line = f.readline()
+        sep = ';' if ';' in first_line else ','
+        big_df = pd.read_csv(
+            full_report_path,
+            sep=sep,
+            low_memory=False,
+            dtype={'Codice ordine': str, 'Data evento': str},
+        )
+        big_df['Codice ordine'] = big_df['Codice ordine'].astype(str)
+        big_df['_posto_num'] = pd.to_numeric(big_df['Posto'], errors='coerce')
+
+        # Build move lookup DataFrame
+        if all_moves:
+            move_df = pd.DataFrame(all_moves)[
+                ['Data evento', 'Codice ordine', 'Posto originale', 'Posto nuovo', 'Stato']
+            ].copy()
+            move_df.rename(columns={'Posto originale': '_posto_num',
+                                    'Posto nuovo':     '_nuovo_posto',
+                                    'Stato':           '_stato'}, inplace=True)
+            move_df['Codice ordine'] = move_df['Codice ordine'].astype(str)
+        else:
+            move_df = pd.DataFrame(
+                columns=['Data evento', 'Codice ordine', '_posto_num', '_nuovo_posto', '_stato']
+            )
+
+        big_df = big_df.merge(
+            move_df,
+            on=['Data evento', 'Codice ordine', '_posto_num'],
+            how='left',
+        )
+
+        # Infeasible mask (vectorised)
+        big_df['_is_inf'] = [
+            (ev, oid) in infeasible_set
+            for ev, oid in zip(big_df['Data evento'], big_df['Codice ordine'])
+        ]
+
+        occupied_mask = big_df['Stato posto'].isin(OCCUPIED)
+        has_move      = big_df['_stato'].notna()
+
+        # Defaults
+        big_df['Nuovo posto'] = big_df['_posto_num']
+        big_df['Stato']       = 'NON COINVOLTO'
+
+        # Infeasible occupied seats
+        inf_mask = occupied_mask & big_df['_is_inf']
+        big_df.loc[inf_mask, 'Stato'] = 'NON RISOLVIBILE'
+
+        # Seats with an explicit move entry (SPOSTATO or COINVOLTO)
+        big_df.loc[has_move, 'Nuovo posto'] = big_df.loc[has_move, '_nuovo_posto']
+        big_df.loc[has_move, 'Stato']       = big_df.loc[has_move, '_stato']
+
+        # CANCELLED / non-occupied always NON COINVOLTO
+        big_df.loc[~occupied_mask, 'Stato']       = 'NON COINVOLTO'
+        big_df.loc[~occupied_mask, 'Nuovo posto'] = big_df.loc[~occupied_mask, '_posto_num']
+
+        # Convert Nuovo posto to nullable int
+        big_df['Nuovo posto'] = pd.to_numeric(big_df['Nuovo posto'], errors='coerce').astype('Int64')
+
+        # Drop temp columns, then insert Nuovo posto + Stato after Posto
+        big_df.drop(columns=['_posto_num', '_nuovo_posto', '_stato', '_is_inf'],
+                    inplace=True, errors='ignore')
+        cols = list(big_df.columns)
+        for c in ('Nuovo posto', 'Stato'):
+            if c in cols:
+                cols.remove(c)
+        posto_idx = cols.index('Posto') + 1
+        cols.insert(posto_idx,     'Nuovo posto')
+        cols.insert(posto_idx + 1, 'Stato')
+        big_df = big_df[cols]
+
+        coll_cols = [
+            'Codice ordine', 'Settore', 'Fila', 'Settore prezzi',
+            'Posto originale', 'Posto nuovo', 'Stato',
+        ]
+        out_path = 'data/report_annotated.xlsx'
+        with pd.ExcelWriter(out_path, engine='openpyxl') as writer:
+            for event_date, group in big_df.groupby('Data evento'):
                 sheet_name = str(event_date).replace(':', '.').replace('/', '-')[:31]
-                group[cols].to_excel(writer, sheet_name=sheet_name, index=False)
+                group.to_excel(writer, sheet_name=sheet_name, index=False)
             if collateral_rows:
                 df_coll = pd.DataFrame(collateral_rows)
-                df_coll[cols].to_excel(writer, sheet_name='COLLATERALE', index=False)
-        total_events = df_all['Data evento'].nunique()
-        print(f'\nTotal rows: {len(all_moves)} moves + {len(infeasible_rows)} infeasible'
-              f' across {total_events} event sheets -> data/reallocation.xlsx', flush=True)
-        if collateral_rows:
-            print(f'  Collateral damage: {len(collateral_rows)} orders broken by displacement'
-                  f' -> sheet COLLATERALE', flush=True)
-    else:
-        print('\nNo output generated.', flush=True)
+                df_coll[coll_cols].to_excel(writer, sheet_name='COLLATERALE', index=False)
 
-    if all_infeasible:
-        print(f'\nWARNING: {len(seen_inf)} orders could not be fixed.')
-    if collateral_rows:
-        print(f'WARNING: {len(collateral_rows)} previously-adjacent orders became'
-              f' non-adjacent as collateral displacement (dense segments, no free seats).',
-              flush=True)
+        spostato  = (big_df['Stato'] == 'SPOSTATO').sum()
+        coinvolto = (big_df['Stato'] == 'COINVOLTO').sum()
+        non_ris   = (big_df['Stato'] == 'NON RISOLVIBILE').sum()
+        print(f'\nAnnotated {len(big_df):,} rows -> {out_path}', flush=True)
+        print(f'  SPOSTATO: {spostato}  COINVOLTO: {coinvolto}  NON RISOLVIBILE: {non_ris}', flush=True)
+        if collateral_rows:
+            print(f'  COLLATERALE: {len(collateral_rows)} orders -> sheet COLLATERALE', flush=True)
+
+    else:
+        # ---------------------------------------------------------------
+        # Summary mode (default): only moved / infeasible seats
+        # ---------------------------------------------------------------
+        seen_inf: set = set()
+        infeasible_rows: list = []
+        for event_date, oid in all_infeasible:
+            if (event_date, oid) in seen_inf:
+                continue
+            seen_inf.add((event_date, oid))
+            order_seats = active[
+                (active['Data evento'] == event_date) &
+                (active['Codice ordine'] == oid)
+            ]
+            for _, row in order_seats.iterrows():
+                infeasible_rows.append({
+                    'Data evento':     event_date,
+                    'Codice ordine':   oid,
+                    'Settore':         row['Settore'],
+                    'Fila':            row['Fila'],
+                    'Settore prezzi':  row['Settore prezzi'],
+                    'Posto originale': row['Posto'],
+                    'Posto nuovo':     row['Posto'],
+                    'Stato':           'NON RISOLVIBILE',
+                })
+
+        cols = [
+            'Codice ordine', 'Settore', 'Fila', 'Settore prezzi',
+            'Posto originale', 'Posto nuovo', 'Stato',
+        ]
+        all_rows = all_moves + infeasible_rows
+        if all_rows:
+            df_all = pd.DataFrame(all_rows)
+            with pd.ExcelWriter('data/reallocation.xlsx', engine='openpyxl') as writer:
+                for event_date, group in df_all.groupby('Data evento'):
+                    sheet_name = str(event_date).replace(':', '.').replace('/', '-')[:31]
+                    group[cols].to_excel(writer, sheet_name=sheet_name, index=False)
+                if collateral_rows:
+                    df_coll = pd.DataFrame(collateral_rows)
+                    df_coll[cols].to_excel(writer, sheet_name='COLLATERALE', index=False)
+            total_events = df_all['Data evento'].nunique()
+            print(f'\nTotal rows: {len(all_moves)} moves + {len(infeasible_rows)} infeasible'
+                  f' across {total_events} event sheets -> data/reallocation.xlsx', flush=True)
+            if collateral_rows:
+                print(f'  Collateral: {len(collateral_rows)} orders -> sheet COLLATERALE', flush=True)
+        else:
+            print('\nNo output generated.', flush=True)
+
+        if all_infeasible:
+            print(f'\nWARNING: {len(seen_inf)} orders could not be fixed.')
+        if collateral_rows:
+            print(f'WARNING: {len(collateral_rows)} previously-adjacent orders became'
+                  f' non-adjacent as collateral displacement (dense segments, no free seats).',
+                  flush=True)
 
 
 if __name__ == '__main__':
