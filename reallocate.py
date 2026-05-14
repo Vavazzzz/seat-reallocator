@@ -7,11 +7,11 @@ finds a rearrangement within the same (Settore, Fila, Settore prezzi) segment
 that makes all its seats adjacent, displacing as few other orders as possible.
 
 Input:
-  report_cleaned.csv  — all sold tickets
-  orders.txt          — problematic order IDs grouped by event date
+  data/report_cleaned.csv  — all sold tickets
+  data/orders.txt          — problematic order IDs grouped by event date
 
 Output:
-  reallocation.csv    — seat moves: (order, old_posto, new_posto) per event
+  data/reallocation.csv    — seat moves: (order, old_posto, new_posto) per event
 """
 
 import ast
@@ -420,11 +420,11 @@ def process_event(event_df: pd.DataFrame, problematic: set) -> tuple:
 
 def main():
     print('Loading tickets...', flush=True)
-    tickets = load_tickets('report_cleaned.csv')
+    tickets = load_tickets('data/report_cleaned.csv')
     print(f'  {len(tickets):,} valid rows across {tickets["Data evento"].nunique()} events.', flush=True)
 
     print('Loading problematic orders...', flush=True)
-    orders_by_event = parse_orders('orders.txt')
+    orders_by_event = parse_orders('data/orders.txt')
 
     all_moves:      list = []
     all_infeasible: list = []   # list of (event_date, order_id)
@@ -525,7 +525,7 @@ def main():
     if all_rows:
         df_all = pd.DataFrame(all_rows)
         # Add collateral sheet separately (different column shape)
-        with pd.ExcelWriter('reallocation.xlsx', engine='openpyxl') as writer:
+        with pd.ExcelWriter('data/reallocation.xlsx', engine='openpyxl') as writer:
             for event_date, group in df_all.groupby('Data evento'):
                 sheet_name = str(event_date).replace(':', '.').replace('/', '-')[:31]
                 group[cols].to_excel(writer, sheet_name=sheet_name, index=False)
@@ -534,7 +534,7 @@ def main():
                 df_coll[cols].to_excel(writer, sheet_name='COLLATERALE', index=False)
         total_events = df_all['Data evento'].nunique()
         print(f'\nTotal rows: {len(all_moves)} moves + {len(infeasible_rows)} infeasible'
-              f' across {total_events} event sheets -> reallocation.xlsx', flush=True)
+              f' across {total_events} event sheets -> data/reallocation.xlsx', flush=True)
         if collateral_rows:
             print(f'  Collateral damage: {len(collateral_rows)} orders broken by displacement'
                   f' -> sheet COLLATERALE', flush=True)
