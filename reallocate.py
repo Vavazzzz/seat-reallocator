@@ -570,7 +570,7 @@ def process_event(event_df: pd.DataFrame, problematic: set) -> tuple:
                 'Codice ordine':   oid,
                 'Posto originale': old_p,
                 'Posto nuovo':     new_p,
-                'Stato':           'SPOSTATO',
+                'Stato':           'SPOSTATO' if old_p != new_p else 'COINVOLTO',
             })
 
     return all_moves, all_infeasible
