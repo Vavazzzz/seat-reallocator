@@ -293,9 +293,9 @@ def solve_segment(seats: dict, free_postos: set, problematic_set: set) -> tuple:
     moves = []
     for oid, old_p in order_postos.items():
         new_p = inv.get(oid, old_p)
-        for old, new in zip(old_p, new_p):
-            if old != new:
-                moves.append((oid, old, new))
+        if any(o != n for o, n in zip(old_p, new_p)):
+            for old, new in zip(old_p, new_p):
+                moves.append((oid, old, new))  # all seats, including unchanged ones
 
     return moves, infeasible
 
@@ -522,9 +522,9 @@ def _solve_segment_bt(seats: dict, free_postos: set, problematic_set: set) -> tu
     moves = []
     for oid, old_p in order_postos.items():
         new_p = inv.get(oid, old_p)
-        for old, new in zip(old_p, new_p):
-            if old != new:
-                moves.append((oid, old, new))
+        if any(o != n for o, n in zip(old_p, new_p)):
+            for old, new in zip(old_p, new_p):
+                moves.append((oid, old, new))  # all seats, including unchanged ones
 
     return moves, infeasible
 
@@ -612,109 +612,80 @@ def main():
         if infeasible:
             print(f'  Could not fix: {infeasible}', flush=True)
 
-    active     = tickets[tickets['Stato posto'].isin(OCCUPIED)]
-    infeasible_set = {(ed, oid) for ed, oid in set(map(tuple, all_infeasible))}
+    active        = tickets[tickets['Stato posto'].isin(OCCUPIED)]
+    infeasible_set = {(ed, oid) for ed, oid in all_infeasible}
 
-    # Index seat-level moves by event for fast lookup
+    # Build infeasible rows: one row per seat of each infeasible order
+    infeasible_rows: list = []
+    seen_inf: set = set()
+    for event_date, oid in all_infeasible:
+        if (event_date, oid) in seen_inf:
+            continue
+        seen_inf.add((event_date, oid))
+        order_seats = active[
+            (active['Data evento'] == event_date) &
+            (active['Codice ordine'] == oid)
+        ]
+        for _, row in order_seats.iterrows():
+            infeasible_rows.append({
+                'Data evento':     event_date,
+                'Codice ordine':   oid,
+                'Settore':         row['Settore'],
+                'Fila':            row['Fila'],
+                'Settore prezzi':  row['Settore prezzi'],
+                'Posto originale': row['Posto'],
+                'Posto nuovo':     row['Posto'],
+                'Stato':           'NON RISOLVIBILE',
+            })
+
+    # Detect collateral damage and build the collateral sheet.
+    # all_moves now includes every seat of each moved order (including unchanged
+    # seats), so we can reconstruct final positions by applying the moves.
+    collateral_rows: list = []
+
     moves_by_event: dict = defaultdict(list)
     for m in all_moves:
         moves_by_event[m['Data evento']].append(m)
 
-    # Build order-level output rows and detect collateral — single pass per event.
-    # Each row shows the order's FULL seat list before and after, making chain
-    # displacements transparent (e.g. an order that had seats [1,2,5] and ends at
-    # [1,2,3] is clearly a prob order being fixed, not a pointless circular swap).
-    spostato_rows:   list = []
-    collateral_rows: list = []
-
     for event_date, event_active in active.groupby('Data evento'):
-        event_moves = moves_by_event.get(event_date, [])
-        event_infeasible = {oid for ed, oid in infeasible_set if ed == event_date}
-        if not event_moves and not event_infeasible:
+        if event_date not in moves_by_event:
             continue
 
-        orig: dict       = defaultdict(list)
-        order_meta: dict = {}
+        orig: dict = defaultdict(list)
         for _, row in event_active.iterrows():
-            oid = row['Codice ordine']
-            orig[oid].append(row['Posto'])
-            order_meta[oid] = (row['Settore'], str(row['Fila']), row['Settore prezzi'])
+            orig[row['Codice ordine']].append(row['Posto'])
 
-        # Apply seat moves to build final positions
-        final: dict    = {oid: sorted(ps) for oid, ps in orig.items()}
-        moved_oids: set = set()
-        for m in event_moves:
+        final: dict = {oid: list(ps) for oid, ps in orig.items()}
+        for m in moves_by_event[event_date]:
             oid = m['Codice ordine']
             op, np_ = m['Posto originale'], m['Posto nuovo']
             if op in final[oid]:
                 final[oid].remove(op)
             if np_ not in final[oid]:
                 final[oid].append(np_)
-            moved_oids.add(oid)
 
-        # One SPOSTATO row per moved order — full seat lists reveal the full picture
-        for oid in moved_oids:
-            s, f, sp = order_meta[oid]
-            spostato_rows.append({
-                'Data evento':    event_date,
-                'Codice ordine':  oid,
-                'Settore':        s,
-                'Fila':           f,
-                'Settore prezzi': sp,
-                'Posti originali': ', '.join(str(p) for p in sorted(orig[oid])),
-                'Posti nuovi':    ', '.join(str(p) for p in sorted(final[oid])),
-                'Stato':          'SPOSTATO',
-            })
-
-        # Collateral: originally adjacent, now non-adjacent
         for oid, orig_ps in orig.items():
             if (event_date, oid) in infeasible_set:
                 continue
             if not is_adjacent(orig_ps) or is_adjacent(final[oid]):
                 continue
-            s, f, sp = order_meta[oid]
+            order_info = event_active[event_active['Codice ordine'] == oid].iloc[0]
             collateral_rows.append({
-                'Data evento':    event_date,
-                'Codice ordine':  oid,
-                'Settore':        s,
-                'Fila':           f,
-                'Settore prezzi': sp,
-                'Posti originali': ', '.join(str(p) for p in sorted(orig_ps)),
-                'Posti nuovi':    ', '.join(str(p) for p in sorted(final[oid])),
-                'Stato':          'COLLATERALE',
+                'Data evento':     event_date,
+                'Codice ordine':   oid,
+                'Settore':         order_info['Settore'],
+                'Fila':            order_info['Fila'],
+                'Settore prezzi':  order_info['Settore prezzi'],
+                'Posto originale': ', '.join(str(p) for p in sorted(orig_ps)),
+                'Posto nuovo':     ', '.join(str(p) for p in sorted(final[oid])),
+                'Stato':           'COLLATERALE',
             })
-
-    # NON RISOLVIBILE: one row per infeasible order (full seat list)
-    infeasible_rows: list = []
-    seen: set = set()
-    for event_date, oid in all_infeasible:
-        if (event_date, oid) in seen:
-            continue
-        seen.add((event_date, oid))
-        order_seats = active[
-            (active['Data evento'] == event_date) &
-            (active['Codice ordine'] == oid)
-        ]
-        if order_seats.empty:
-            continue
-        row0   = order_seats.iloc[0]
-        seats  = ', '.join(str(p) for p in sorted(order_seats['Posto'].tolist()))
-        infeasible_rows.append({
-            'Data evento':    event_date,
-            'Codice ordine':  oid,
-            'Settore':        row0['Settore'],
-            'Fila':           str(row0['Fila']),
-            'Settore prezzi': row0['Settore prezzi'],
-            'Posti originali': seats,
-            'Posti nuovi':    seats,
-            'Stato':          'NON RISOLVIBILE',
-        })
 
     cols = [
         'Codice ordine', 'Settore', 'Fila', 'Settore prezzi',
-        'Posti originali', 'Posti nuovi', 'Stato',
+        'Posto originale', 'Posto nuovo', 'Stato',
     ]
-    all_rows = spostato_rows + infeasible_rows
+    all_rows = all_moves + infeasible_rows
     if all_rows:
         df_all = pd.DataFrame(all_rows)
         with pd.ExcelWriter('data/reallocation.xlsx', engine='openpyxl') as writer:
@@ -725,16 +696,16 @@ def main():
                 df_coll = pd.DataFrame(collateral_rows)
                 df_coll[cols].to_excel(writer, sheet_name='COLLATERALE', index=False)
         total_events = df_all['Data evento'].nunique()
-        print(f'\nTotal: {len(spostato_rows)} orders moved + {len(infeasible_rows)} infeasible'
+        print(f'\nTotal rows: {len(all_moves)} moves + {len(infeasible_rows)} infeasible'
               f' across {total_events} event sheets -> data/reallocation.xlsx', flush=True)
         if collateral_rows:
-            print(f'  Collateral damage: {len(collateral_rows)} orders -> sheet COLLATERALE',
-                  flush=True)
+            print(f'  Collateral damage: {len(collateral_rows)} orders broken by displacement'
+                  f' -> sheet COLLATERALE', flush=True)
     else:
         print('\nNo output generated.', flush=True)
 
     if all_infeasible:
-        print(f'\nWARNING: {len(set(map(tuple, all_infeasible)))} orders could not be fixed.')
+        print(f'\nWARNING: {len(seen_inf)} orders could not be fixed.')
     if collateral_rows:
         print(f'WARNING: {len(collateral_rows)} previously-adjacent orders became'
               f' non-adjacent as collateral displacement (dense segments, no free seats).',
