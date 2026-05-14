@@ -134,6 +134,22 @@ def is_adjacent(postos: list) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Seat pairing
+# ---------------------------------------------------------------------------
+
+def _pair_seats(old_p: list, new_p: list) -> list:
+    """
+    Match old seats to new seats minimising the number that move.
+    Seats present in both lists stay fixed; the rest are paired in sorted order.
+    Returns [(old_seat, new_seat), ...].
+    """
+    kept = set(old_p) & set(new_p)
+    remaining_old = sorted(set(old_p) - kept)
+    remaining_new = sorted(set(new_p) - kept)
+    return [(s, s) for s in sorted(kept)] + list(zip(remaining_old, remaining_new))
+
+
+# ---------------------------------------------------------------------------
 # Segment solver
 # ---------------------------------------------------------------------------
 
@@ -293,9 +309,9 @@ def solve_segment(seats: dict, free_postos: set, problematic_set: set) -> tuple:
     moves = []
     for oid, old_p in order_postos.items():
         new_p = inv.get(oid, old_p)
-        if any(o != n for o, n in zip(old_p, new_p)):
-            for old, new in zip(old_p, new_p):
-                moves.append((oid, old, new))  # all seats, including unchanged ones
+        if set(old_p) != set(new_p):
+            for old, new in _pair_seats(old_p, new_p):
+                moves.append((oid, old, new))
 
     return moves, infeasible
 
@@ -522,9 +538,9 @@ def _solve_segment_bt(seats: dict, free_postos: set, problematic_set: set) -> tu
     moves = []
     for oid, old_p in order_postos.items():
         new_p = inv.get(oid, old_p)
-        if any(o != n for o, n in zip(old_p, new_p)):
-            for old, new in zip(old_p, new_p):
-                moves.append((oid, old, new))  # all seats, including unchanged ones
+        if set(old_p) != set(new_p):
+            for old, new in _pair_seats(old_p, new_p):
+                moves.append((oid, old, new))
 
     return moves, infeasible
 
