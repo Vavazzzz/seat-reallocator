@@ -178,34 +178,23 @@ def solve_segment(seats: dict, free_postos: set, problematic_set: set) -> tuple:
     def get_blocks(k: int) -> list:
         return [tuple(run[i:i + k]) for run in runs for i in range(len(run) - k + 1)]
 
-    # ILP covers prob orders only.  Non-prob orders are assigned in a greedy
-    # post-pass (same logic as the backtracking solver) so intact non-prob orders
-    # naturally reclaim their original seats without unnecessary circular swaps.
-    #
-    # Each prob order also gets its original (non-contiguous) seats as a dummy
-    # option carrying INFEASIBLE_PENALTY so the model is always feasible.
+    # All orders are in the model so the ILP jointly optimises the full segment.
+    # Prob orders also get their original (non-contiguous) seats as a dummy option
+    # carrying INFEASIBLE_PENALTY — chosen only when no contiguous block fits.
     candidates: dict = {}
-    for oid, postos in to_fix.items():
+    for oid, postos in order_postos.items():
         blocks = get_blocks(len(postos))
-        orig   = tuple(postos)
-        if orig not in blocks:
-            blocks = blocks + [orig]
+        if oid in to_fix:
+            orig = tuple(postos)
+            if orig not in blocks:
+                blocks = blocks + [orig]
         candidates[oid] = blocks
 
     INFEASIBLE_PENALTY = 1_000_000
-    # Proxy cost per non-prob-adjacent seat a prob order displaces.  Keeps the
-    # ILP from choosing blocks that unnecessarily evict non-prob adjacent orders.
-    PROXY_PENALTY      = 500
-
-    non_prob_adj_seats: set = {
-        p
-        for oid, postos in order_postos.items()
-        if oid not in to_fix and is_adjacent(postos)
-        for p in postos
-    }
+    COLL_PENALTY       = 10_000
 
     mdl = pulp.LpProblem("seats", pulp.LpMinimize)
-    oi  = {oid: i for i, oid in enumerate(to_fix)}
+    oi  = {oid: i for i, oid in enumerate(order_postos)}
 
     x: dict = {
         (oid, b): pulp.LpVariable(f"x{oi[oid]}_{bi}", cat="Binary")
@@ -213,11 +202,11 @@ def solve_segment(seats: dict, free_postos: set, problematic_set: set) -> tuple:
         for bi, b in enumerate(blocks)
     }
 
-    # Each prob order → exactly one block
+    # Each order → exactly one block
     for oid, blocks in candidates.items():
         mdl += pulp.lpSum(x[oid, b] for b in blocks) == 1
 
-    # No two prob orders share a seat
+    # Each seat → at most one block
     seat_vars: dict = defaultdict(list)
     for (oid, b), var in x.items():
         for seat in b:
@@ -226,19 +215,44 @@ def solve_segment(seats: dict, free_postos: set, problematic_set: set) -> tuple:
         if len(var_list) > 1:
             mdl += pulp.lpSum(var_list) <= 1
 
-    # Objective: displacement + infeasible penalty + proxy collateral cost
+    # Objective
+    #
+    # Prob orders:
+    #   dummy block (original non-contiguous seats) → INFEASIBLE_PENALTY
+    #   any contiguous block                        → seat displacement
+    #
+    # Non-prob originally-adjacent orders:
+    #   original block                              → 0
+    #   any other block                             → COLL_PENALTY + displacement
+    #   (displacement tiebreaker eliminates degenerate circular permutations
+    #    — every possible assignment gets a unique score, so the solver always
+    #    picks the one that moves the order the least distance from its origin)
+    #
+    # Non-prob originally-non-adjacent orders:
+    #   any block                                   → centroid displacement
+    #   (keeps them close to where they were without forcing collateral cost)
     obj = []
     for oid, blocks in candidates.items():
-        postos = to_fix[oid]
+        postos = order_postos[oid]
         orig   = tuple(postos)
-        for b in blocks:
-            var = x[oid, b]
-            if b == orig:
-                obj.append(INFEASIBLE_PENALTY * var)
-            else:
-                disp  = sum(abs(nb - ob) for nb, ob in zip(b, postos))
-                proxy = PROXY_PENALTY * sum(1 for p in b if p in non_prob_adj_seats)
-                obj.append((disp + proxy) * var)
+        if oid in to_fix:
+            for b in blocks:
+                if b == orig:
+                    obj.append(INFEASIBLE_PENALTY * x[oid, b])
+                else:
+                    disp = sum(abs(nb - ob) for nb, ob in zip(b, postos))
+                    obj.append(disp * x[oid, b])
+        elif is_adjacent(postos) and orig in blocks:
+            for b in blocks:
+                if b != orig:
+                    disp = sum(abs(nb - ob) for nb, ob in zip(b, postos))
+                    obj.append((COLL_PENALTY + disp) * x[oid, b])
+        else:
+            centroid = sum(postos) / len(postos)
+            for b in blocks:
+                disp = abs(sum(b) / len(b) - centroid)
+                if disp:
+                    obj.append(disp * x[oid, b])
 
     mdl += pulp.lpSum(obj)
 
@@ -247,63 +261,27 @@ def solve_segment(seats: dict, free_postos: set, problematic_set: set) -> tuple:
     if mdl.sol_status not in (1, 2):    # 1=Optimal, 2=IntegerFeasible (time limit)
         return _solve_segment_bt(seats, free_postos, problematic_set)
 
-    # Extract prob placement
-    prob_placement: dict = {}
+    # Extract: find the chosen block for each order
+    assignment: dict = {}
     for oid, blocks in candidates.items():
         for b in blocks:
             if (pulp.value(x[oid, b]) or 0) > 0.5:
-                prob_placement[oid] = b
+                assignment[oid] = b
                 break
 
     # Infeasible = prob orders that chose their dummy (original non-contiguous) block
     infeasible = [oid for oid in to_fix
-                  if prob_placement.get(oid) == tuple(to_fix[oid])]
+                  if assignment.get(oid) == tuple(order_postos[oid])]
 
-    # Lock in prob seats
+    # Build seat → order map
     new_asgn: dict = {}
-    for oid, b in prob_placement.items():
+    for oid, b in assignment.items():
         for p in b:
             new_asgn[p] = oid
-
-    prob_taken = set(new_asgn.keys())
-    remaining  = set(p for p in all_pos if p not in new_asgn)
-
-    # Greedy pool for non-prob orders — mirrors _solve_segment_bt's post-pass.
-    # Displaced orders (any seat in prob_taken) go first; intact orders follow
-    # and will find their original block at distance 0 (naturally stays put).
-    displaced_np = sorted(
-        [(oid, op) for oid, op in order_postos.items()
-         if oid not in to_fix and any(p in prob_taken for p in op)],
-        key=lambda x: -len(x[1]),
-    )
-    intact_np = sorted(
-        [(oid, op) for oid, op in order_postos.items()
-         if oid not in to_fix and all(p not in prob_taken for p in op)],
-        key=lambda x: (-len(x[1]), min(x[1])),
-    )
-
-    for oid, old_p in displaced_np + intact_np:
-        k        = len(old_p)
-        centroid = sum(old_p) / k
-        rem_list = sorted(remaining)
-
-        best_block = None
-        best_dist  = float('inf')
-        for run in contiguous_runs(rem_list):
-            for i in range(len(run) - k + 1):
-                block = tuple(run[i:i + k])
-                d = abs(sum(block) / k - centroid)
-                if d < best_dist:
-                    best_dist  = d
-                    best_block = block
-
-        if best_block is None:
-            rem_list.sort(key=lambda p: abs(p - centroid))
-            best_block = tuple(rem_list[:k]) if len(rem_list) >= k else tuple(rem_list)
-
-        for p in best_block:
-            new_asgn[p] = oid
-            remaining.discard(p)
+    for oid, postos in order_postos.items():    # safety: any unassigned order stays
+        if oid not in assignment:
+            for p in postos:
+                new_asgn[p] = oid
 
     # Emit seat-level moves
     inv: dict = defaultdict(list)
@@ -634,81 +612,111 @@ def main():
         if infeasible:
             print(f'  Could not fix: {infeasible}', flush=True)
 
-    active = tickets[tickets['Stato posto'].isin(OCCUPIED)]
+    active     = tickets[tickets['Stato posto'].isin(OCCUPIED)]
+    infeasible_set = {(ed, oid) for ed, oid in set(map(tuple, all_infeasible))}
 
-    # Build infeasible rows: one row per seat of each infeasible order
-    infeasible_rows: list = []
-    for event_date, oid in all_infeasible:
-        order_seats = active[
-            (active['Data evento'] == event_date) &
-            (active['Codice ordine'] == oid)
-        ]
-        for _, row in order_seats.iterrows():
-            infeasible_rows.append({
-                'Data evento':     event_date,
-                'Codice ordine':   oid,
-                'Settore':         row['Settore'],
-                'Fila':            row['Fila'],
-                'Settore prezzi':  row['Settore prezzi'],
-                'Posto originale': row['Posto'],
-                'Posto nuovo':     row['Posto'],
-                'Stato':           'NON RISOLVIBILE',
-            })
+    # Index seat-level moves by event for fast lookup
+    moves_by_event: dict = defaultdict(list)
+    for m in all_moves:
+        moves_by_event[m['Data evento']].append(m)
 
-    # Detect collateral damage: orders that were adjacent but are now non-adjacent
-    # after moves were applied (displaced as a side-effect of fixing prob orders).
+    # Build order-level output rows and detect collateral — single pass per event.
+    # Each row shows the order's FULL seat list before and after, making chain
+    # displacements transparent (e.g. an order that had seats [1,2,5] and ends at
+    # [1,2,3] is clearly a prob order being fixed, not a pointless circular swap).
+    spostato_rows:   list = []
     collateral_rows: list = []
-    infeasible_set  = {(ed, oid) for ed, oid in all_infeasible}
 
     for event_date, event_active in active.groupby('Data evento'):
-        if event_date not in {m['Data evento'] for m in all_moves}:
+        event_moves = moves_by_event.get(event_date, [])
+        event_infeasible = {oid for ed, oid in infeasible_set if ed == event_date}
+        if not event_moves and not event_infeasible:
             continue
 
-        # Original positions per order
-        orig: dict = defaultdict(list)
+        orig: dict       = defaultdict(list)
+        order_meta: dict = {}
         for _, row in event_active.iterrows():
-            orig[row['Codice ordine']].append(row['Posto'])
+            oid = row['Codice ordine']
+            orig[oid].append(row['Posto'])
+            order_meta[oid] = (row['Settore'], str(row['Fila']), row['Settore prezzi'])
 
-        # Apply this event's moves to get final positions
-        final: dict = {oid: list(ps) for oid, ps in orig.items()}
-        for m in all_moves:
-            if m['Data evento'] != event_date or m['Stato'] != 'SPOSTATO':
-                continue
+        # Apply seat moves to build final positions
+        final: dict    = {oid: sorted(ps) for oid, ps in orig.items()}
+        moved_oids: set = set()
+        for m in event_moves:
             oid = m['Codice ordine']
             op, np_ = m['Posto originale'], m['Posto nuovo']
             if op in final[oid]:
                 final[oid].remove(op)
-            final[oid].append(np_)
+            if np_ not in final[oid]:
+                final[oid].append(np_)
+            moved_oids.add(oid)
 
+        # One SPOSTATO row per moved order — full seat lists reveal the full picture
+        for oid in moved_oids:
+            s, f, sp = order_meta[oid]
+            spostato_rows.append({
+                'Data evento':    event_date,
+                'Codice ordine':  oid,
+                'Settore':        s,
+                'Fila':           f,
+                'Settore prezzi': sp,
+                'Posti originali': ', '.join(str(p) for p in sorted(orig[oid])),
+                'Posti nuovi':    ', '.join(str(p) for p in sorted(final[oid])),
+                'Stato':          'SPOSTATO',
+            })
+
+        # Collateral: originally adjacent, now non-adjacent
         for oid, orig_ps in orig.items():
             if (event_date, oid) in infeasible_set:
                 continue
-            if not is_adjacent(orig_ps):
-                continue  # already non-adjacent before our tool ran
-            if is_adjacent(final[oid]):
-                continue  # still adjacent — fine
-
-            # This order was adjacent before and non-adjacent after: collateral damage
-            order_info = event_active[event_active['Codice ordine'] == oid].iloc[0]
+            if not is_adjacent(orig_ps) or is_adjacent(final[oid]):
+                continue
+            s, f, sp = order_meta[oid]
             collateral_rows.append({
-                'Data evento':     event_date,
-                'Codice ordine':   oid,
-                'Settore':         order_info['Settore'],
-                'Fila':            order_info['Fila'],
-                'Settore prezzi':  order_info['Settore prezzi'],
-                'Posto originale': ', '.join(str(p) for p in sorted(orig_ps)),
-                'Posto nuovo':     ', '.join(str(p) for p in sorted(final[oid])),
-                'Stato':           'COLLATERALE',
+                'Data evento':    event_date,
+                'Codice ordine':  oid,
+                'Settore':        s,
+                'Fila':           f,
+                'Settore prezzi': sp,
+                'Posti originali': ', '.join(str(p) for p in sorted(orig_ps)),
+                'Posti nuovi':    ', '.join(str(p) for p in sorted(final[oid])),
+                'Stato':          'COLLATERALE',
             })
+
+    # NON RISOLVIBILE: one row per infeasible order (full seat list)
+    infeasible_rows: list = []
+    seen: set = set()
+    for event_date, oid in all_infeasible:
+        if (event_date, oid) in seen:
+            continue
+        seen.add((event_date, oid))
+        order_seats = active[
+            (active['Data evento'] == event_date) &
+            (active['Codice ordine'] == oid)
+        ]
+        if order_seats.empty:
+            continue
+        row0   = order_seats.iloc[0]
+        seats  = ', '.join(str(p) for p in sorted(order_seats['Posto'].tolist()))
+        infeasible_rows.append({
+            'Data evento':    event_date,
+            'Codice ordine':  oid,
+            'Settore':        row0['Settore'],
+            'Fila':           str(row0['Fila']),
+            'Settore prezzi': row0['Settore prezzi'],
+            'Posti originali': seats,
+            'Posti nuovi':    seats,
+            'Stato':          'NON RISOLVIBILE',
+        })
 
     cols = [
         'Codice ordine', 'Settore', 'Fila', 'Settore prezzi',
-        'Posto originale', 'Posto nuovo', 'Stato',
+        'Posti originali', 'Posti nuovi', 'Stato',
     ]
-    all_rows = all_moves + infeasible_rows
+    all_rows = spostato_rows + infeasible_rows
     if all_rows:
         df_all = pd.DataFrame(all_rows)
-        # Add collateral sheet separately (different column shape)
         with pd.ExcelWriter('data/reallocation.xlsx', engine='openpyxl') as writer:
             for event_date, group in df_all.groupby('Data evento'):
                 sheet_name = str(event_date).replace(':', '.').replace('/', '-')[:31]
@@ -717,16 +725,16 @@ def main():
                 df_coll = pd.DataFrame(collateral_rows)
                 df_coll[cols].to_excel(writer, sheet_name='COLLATERALE', index=False)
         total_events = df_all['Data evento'].nunique()
-        print(f'\nTotal rows: {len(all_moves)} moves + {len(infeasible_rows)} infeasible'
+        print(f'\nTotal: {len(spostato_rows)} orders moved + {len(infeasible_rows)} infeasible'
               f' across {total_events} event sheets -> data/reallocation.xlsx', flush=True)
         if collateral_rows:
-            print(f'  Collateral damage: {len(collateral_rows)} orders broken by displacement'
-                  f' -> sheet COLLATERALE', flush=True)
+            print(f'  Collateral damage: {len(collateral_rows)} orders -> sheet COLLATERALE',
+                  flush=True)
     else:
         print('\nNo output generated.', flush=True)
 
     if all_infeasible:
-        print(f'\nWARNING: {len(all_infeasible)} orders could not be fixed.')
+        print(f'\nWARNING: {len(set(map(tuple, all_infeasible)))} orders could not be fixed.')
     if collateral_rows:
         print(f'WARNING: {len(collateral_rows)} previously-adjacent orders became'
               f' non-adjacent as collateral displacement (dense segments, no free seats).',
