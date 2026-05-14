@@ -139,8 +139,192 @@ def is_adjacent(postos: list) -> bool:
 
 def solve_segment(seats: dict, free_postos: set, problematic_set: set) -> tuple:
     """
-    Rearrange orders within a single (settore, fila, settore_prezzi) segment so
-    that every problematic order occupies a contiguous run of seat numbers.
+    ILP-based seat reallocator. Falls back to backtracking (_solve_segment_bt)
+    if pulp is unavailable or the solver finds no feasible solution.
+
+    Model: one binary variable x[order, block] per (order, contiguous-block) pair.
+      - Each order gets exactly one block.
+      - No seat is claimed by two orders.
+    Objective: minimise COLL_PENALTY * collateral + prob_displacement.
+      - Non-prob originally-adjacent orders pay COLL_PENALTY if moved elsewhere.
+      - Prob orders that cannot be fixed pay INFEASIBLE_PENALTY (stay in place).
+
+    Returns:
+        moves:      [(order_id, old_posto, new_posto), ...]
+        infeasible: [order_id, ...]   — orders that could not be made adjacent
+    """
+    try:
+        import pulp
+    except ImportError:
+        return _solve_segment_bt(seats, free_postos, problematic_set)
+
+    order_postos: dict = defaultdict(list)
+    for pos, oid in seats.items():
+        order_postos[oid].append(pos)
+    for oid in order_postos:
+        order_postos[oid].sort()
+
+    to_fix = {
+        oid: postos
+        for oid, postos in order_postos.items()
+        if oid in problematic_set and not is_adjacent(postos)
+    }
+    if not to_fix:
+        return [], []
+
+    all_pos = sorted(set(seats) | free_postos)
+    runs    = contiguous_runs(all_pos)
+
+    def get_blocks(k: int) -> list:
+        return [tuple(run[i:i + k]) for run in runs for i in range(len(run) - k + 1)]
+
+    # ILP covers prob orders only.  Non-prob orders are assigned in a greedy
+    # post-pass (same logic as the backtracking solver) so intact non-prob orders
+    # naturally reclaim their original seats without unnecessary circular swaps.
+    #
+    # Each prob order also gets its original (non-contiguous) seats as a dummy
+    # option carrying INFEASIBLE_PENALTY so the model is always feasible.
+    candidates: dict = {}
+    for oid, postos in to_fix.items():
+        blocks = get_blocks(len(postos))
+        orig   = tuple(postos)
+        if orig not in blocks:
+            blocks = blocks + [orig]
+        candidates[oid] = blocks
+
+    INFEASIBLE_PENALTY = 1_000_000
+    # Proxy cost per non-prob-adjacent seat a prob order displaces.  Keeps the
+    # ILP from choosing blocks that unnecessarily evict non-prob adjacent orders.
+    PROXY_PENALTY      = 500
+
+    non_prob_adj_seats: set = {
+        p
+        for oid, postos in order_postos.items()
+        if oid not in to_fix and is_adjacent(postos)
+        for p in postos
+    }
+
+    mdl = pulp.LpProblem("seats", pulp.LpMinimize)
+    oi  = {oid: i for i, oid in enumerate(to_fix)}
+
+    x: dict = {
+        (oid, b): pulp.LpVariable(f"x{oi[oid]}_{bi}", cat="Binary")
+        for oid, blocks in candidates.items()
+        for bi, b in enumerate(blocks)
+    }
+
+    # Each prob order → exactly one block
+    for oid, blocks in candidates.items():
+        mdl += pulp.lpSum(x[oid, b] for b in blocks) == 1
+
+    # No two prob orders share a seat
+    seat_vars: dict = defaultdict(list)
+    for (oid, b), var in x.items():
+        for seat in b:
+            seat_vars[seat].append(var)
+    for seat, var_list in seat_vars.items():
+        if len(var_list) > 1:
+            mdl += pulp.lpSum(var_list) <= 1
+
+    # Objective: displacement + infeasible penalty + proxy collateral cost
+    obj = []
+    for oid, blocks in candidates.items():
+        postos = to_fix[oid]
+        orig   = tuple(postos)
+        for b in blocks:
+            var = x[oid, b]
+            if b == orig:
+                obj.append(INFEASIBLE_PENALTY * var)
+            else:
+                disp  = sum(abs(nb - ob) for nb, ob in zip(b, postos))
+                proxy = PROXY_PENALTY * sum(1 for p in b if p in non_prob_adj_seats)
+                obj.append((disp + proxy) * var)
+
+    mdl += pulp.lpSum(obj)
+
+    mdl.solve(pulp.PULP_CBC_CMD(msg=0, timeLimit=10))
+
+    if mdl.sol_status not in (1, 2):    # 1=Optimal, 2=IntegerFeasible (time limit)
+        return _solve_segment_bt(seats, free_postos, problematic_set)
+
+    # Extract prob placement
+    prob_placement: dict = {}
+    for oid, blocks in candidates.items():
+        for b in blocks:
+            if (pulp.value(x[oid, b]) or 0) > 0.5:
+                prob_placement[oid] = b
+                break
+
+    # Infeasible = prob orders that chose their dummy (original non-contiguous) block
+    infeasible = [oid for oid in to_fix
+                  if prob_placement.get(oid) == tuple(to_fix[oid])]
+
+    # Lock in prob seats
+    new_asgn: dict = {}
+    for oid, b in prob_placement.items():
+        for p in b:
+            new_asgn[p] = oid
+
+    prob_taken = set(new_asgn.keys())
+    remaining  = set(p for p in all_pos if p not in new_asgn)
+
+    # Greedy pool for non-prob orders — mirrors _solve_segment_bt's post-pass.
+    # Displaced orders (any seat in prob_taken) go first; intact orders follow
+    # and will find their original block at distance 0 (naturally stays put).
+    displaced_np = sorted(
+        [(oid, op) for oid, op in order_postos.items()
+         if oid not in to_fix and any(p in prob_taken for p in op)],
+        key=lambda x: -len(x[1]),
+    )
+    intact_np = sorted(
+        [(oid, op) for oid, op in order_postos.items()
+         if oid not in to_fix and all(p not in prob_taken for p in op)],
+        key=lambda x: (-len(x[1]), min(x[1])),
+    )
+
+    for oid, old_p in displaced_np + intact_np:
+        k        = len(old_p)
+        centroid = sum(old_p) / k
+        rem_list = sorted(remaining)
+
+        best_block = None
+        best_dist  = float('inf')
+        for run in contiguous_runs(rem_list):
+            for i in range(len(run) - k + 1):
+                block = tuple(run[i:i + k])
+                d = abs(sum(block) / k - centroid)
+                if d < best_dist:
+                    best_dist  = d
+                    best_block = block
+
+        if best_block is None:
+            rem_list.sort(key=lambda p: abs(p - centroid))
+            best_block = tuple(rem_list[:k]) if len(rem_list) >= k else tuple(rem_list)
+
+        for p in best_block:
+            new_asgn[p] = oid
+            remaining.discard(p)
+
+    # Emit seat-level moves
+    inv: dict = defaultdict(list)
+    for pos, oid in new_asgn.items():
+        inv[oid].append(pos)
+    for oid in inv:
+        inv[oid].sort()
+
+    moves = []
+    for oid, old_p in order_postos.items():
+        new_p = inv.get(oid, old_p)
+        for old, new in zip(old_p, new_p):
+            if old != new:
+                moves.append((oid, old, new))
+
+    return moves, infeasible
+
+
+def _solve_segment_bt(seats: dict, free_postos: set, problematic_set: set) -> tuple:
+    """
+    Backtracking fallback used when pulp is unavailable or the ILP has no solution.
 
     Strategy:
       1. Backtracking search places each prob order in the best available contiguous
