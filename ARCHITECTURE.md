@@ -1,6 +1,7 @@
 # Seat Reallocator — Architectural Walkthrough
 
 > Complete internal documentation of `reallocate.py` for developers who need to understand or modify the system.
+> Reflects the ILP-based implementation.
 
 ---
 
@@ -12,53 +13,65 @@ Each ticket order can cover multiple seats. The ticketing system sometimes assig
 
 ### Overall approach
 
-The algorithm is a **greedy warm-start + branch-and-bound backtracking search** operating on independent 1-D segments.
+The primary solver is an **Integer Linear Program (ILP)** that jointly optimizes seat assignments for every order in a segment in a single shot. The old greedy-warm-start + backtracking search is retained as a fallback (`_solve_segment_bt`) used only when the `pulp` library is unavailable or the ILP finds no feasible solution.
 
-The key insight is that the seating problem decomposes naturally: a seat in `(Settore B, Row 7, price PRIMO)` can only be swapped with another seat in the exact same `(Settore, Fila, Settore prezzi)` triple. This means every such triple is a completely independent sub-problem. Once you decompose into these segments, each segment is a 1-D packing problem: given a list of integer positions, find an assignment of consecutive blocks to problematic orders.
+The key insight driving decomposition is unchanged: a seat in `(Settore B, Row 7, price PRIMO)` can only be swapped with another seat in the exact same `(Settore, Fila, Settore prezzi)` triple. Every such triple is an independent 1-D sub-problem, solved separately.
 
 ### Main execution flow
 
 ```
-parse_orders()   → {event_date: {order_ids}}
-load_tickets()   → filtered DataFrame
-                    ↓
+parse_orders()      → {event_date: {order_ids}}
+load_tickets()      → filtered DataFrame (auto-detects ; or , separator)
+                       ↓
 for each event_date:
   process_event()
-    resolve_seats()    → occupied + free seat maps
-    build_segments()   → independent (settore, fila, sp) sub-problems
+    resolve_seats()     → occupied + free seat maps
+    build_segments()    → independent (settore, fila, sp) sub-problems
     cross-segment check → immediately flag orders spanning >1 segment
     for each relevant segment:
-      solve_segment()  → branch-and-bound over contiguous block placements
-        greedy warm-start → seeds upper bound
-        backtrack()       → explores tree, prunes early
-        repair phase      → assigns evicted non-problematic orders to nearest free slots
-        emit moves        → (order, old_posto, new_posto) per seat changed
-                    ↓
-write reallocation.xlsx (one sheet per event)
+      solve_segment()   [ILP path]
+        build binary variables x[order, block]
+        add assignment constraints
+        add seat-conflict constraints
+        build tiered objective (INFEASIBLE_PENALTY / COLL_PENALTY / displacement)
+        solve with CBC (10-second limit)
+        → on failure: _solve_segment_bt() [backtracking fallback]
+        extract assignment, emit moves
+                       ↓
+collateral detection  → identify orders adjacent before but not after
+                       ↓
+write output:
+  default mode    → data/reallocation.xlsx   (moved + infeasible seats only)
+  --full-report   → data/report_annotated.xlsx (every row annotated)
 ```
 
-### Why this approach
+### Why ILP over backtracking
 
-- **Decomposition** is exact: swapping seats across sectors/rows/price-categories is forbidden by hard constraint, so segments are truly independent.
-- **Branch-and-bound** is exact within the 1-second time limit and the `MAX_BRANCHES=25` candidate cap. It guarantees the globally minimum-cost placement for a segment if it finishes in time.
-- **Greedy warm-start** is a practical necessity: it gives the backtracker a strong upper bound from the very first call, enabling it to prune most branches immediately instead of exploring blindly.
-- **Eviction penalty of 100** in the cost function makes displacing a non-problematic occupant roughly equivalent to moving an order 100 seats — so the algorithm strongly prefers solutions that use free slots, resorting to eviction only when necessary.
+The backtracking solver had two fundamental limitations:
+
+1. **Non-problematic orders were handled by a separate greedy repair** after the search placed the problematic orders. The greedy repair could scatter previously-adjacent non-problematic orders (collateral damage) in ways the backtracker never saw or optimized.
+
+2. **The objective was local**: cost was `displacement + 100 × evictions` per problematic order, which did not directly penalize collateral damage to non-problematic orders.
+
+The ILP addresses both by placing **every order in the model simultaneously**. The optimizer sees the full picture and can trade off between fixing problematic orders and preserving non-problematic ones in a single pass, with an explicit cost hierarchy enforced by penalty tiers.
 
 ---
 
 ## 2. File/module breakdown
 
-The entire codebase is **one file**: `reallocate.py`. There are no imports of internal modules and no sub-packages. The file is segmented by comment banners:
+The entire codebase is **one file**: `reallocate.py`. Structured by comment banners:
 
 | Section | Lines | Responsibility |
 |---|---|---|
-| Constants | 23–26 | `OCCUPIED`, `VALID`, `MAX_BRANCHES` |
-| I/O | 32–55 | Reading inputs |
-| Seat resolution | 62–105 | Building clean seat-state maps |
-| 1-D geometry | 112–129 | Helpers for consecutive-run logic |
-| Segment solver | 136–286 | Core algorithm |
-| Event processing | 293–333 | Per-event orchestration |
-| Entry point | 340–414 | Top-level flow and output |
+| Constants | 23–25 | `OCCUPIED`, `VALID`, `MAX_BRANCHES` |
+| I/O | 32–59 | Reading inputs, auto-detecting separator |
+| Seat resolution | 66–109 | Building clean seat-state maps |
+| 1-D geometry | 116–133 | Helpers for consecutive-run logic |
+| Seat pairing | 140–149 | Smart old/new seat matching |
+| ILP solver | 156–316 | Primary solver (`solve_segment`) |
+| Backtracking fallback | 319–545 | Secondary solver (`_solve_segment_bt`) |
+| Event processing | 552–592 | Per-event orchestration |
+| Entry point | 599–841 | Argument parsing, collateral detection, two output modes |
 
 **Dependency graph** (call direction →):
 
@@ -69,14 +82,19 @@ main()
   └── process_event()
         ├── resolve_seats()
         ├── build_segments()
-        └── solve_segment()
+        └── solve_segment()            [ILP primary]
               ├── is_adjacent()
-              ├── contiguous_runs()          ← via candidate_blocks() inner fn
-              ├── step_cost()                ← inner fn
-              └── backtrack()               ← inner fn (recursive)
+              ├── contiguous_runs()    ← via get_blocks() inner fn
+              ├── _pair_seats()
+              └── _solve_segment_bt() [fallback]
+                    ├── is_adjacent()
+                    ├── contiguous_runs()
+                    ├── simulate_collateral()
+                    ├── record_if_better()
+                    └── _pair_seats()
 ```
 
-No external dependencies except `pandas` for CSV loading and `ast`/`time` from the standard library.
+**External dependencies**: `pandas` (data loading), `pulp` (ILP solver — optional, graceful fallback if absent), `openpyxl` (Excel output). `ast`, `time`, `collections`, `argparse` from the standard library.
 
 ---
 
@@ -90,453 +108,600 @@ No external dependencies except `pandas` for CSV loading and `ast`/`time` from t
 
 **Output**: `dict[str, set[str]]` — `{event_date_str: set_of_order_id_strings}`
 
-**Logic**: Each line has the format `"2026-06-06 20:30:00.0: ['3406711', '3407635', ...]"`. The function splits on `': '` (with a limit of 1 to handle any colons in the date string), then uses `ast.literal_eval` to safely parse the bracketed Python list literal on the right side. The result is converted to a `set` for O(1) membership tests later.
+**Logic**: Each line has the format `"2026-06-06 20:30:00.0: ['3406711', '3407635', ...]"`. Split on `': '` (limit 1 to handle colons in the date), then `ast.literal_eval` safely parses the Python list literal. Result is converted to a `set` for O(1) membership tests.
 
-**Why `ast.literal_eval`**: The file uses Python list syntax. `json.loads` would fail because the order IDs are quoted with single quotes (not JSON-legal). `eval` would work but is a security risk. `ast.literal_eval` is the safe middle ground — it only evaluates Python literals, not arbitrary expressions.
+**Why `ast.literal_eval`**: The file uses Python list syntax with single-quoted strings — `json.loads` would fail. `eval` works but is a security risk. `ast.literal_eval` evaluates only Python literals, not arbitrary expressions.
 
-**Called by**: `main()` once at startup.
+**Called by**: `main()`.
 
 ---
 
 ### `load_tickets(path)` — line 45
 
-**Purpose**: Load and clean `report_cleaned.csv`.
+**Purpose**: Load and clean a CSV (either `report_cleaned.csv` or the full report in `--full-report` mode).
 
-**Input**: CSV path string.
+**Input**: CSV path.
 
-**Output**: `pd.DataFrame` with only valid rows and `Posto` as an integer column.
+**Output**: cleaned `pd.DataFrame` with `Posto` as `int`.
 
-**Logic step by step**:
-1. `pd.read_csv` with `dtype={'Codice ordine': str, 'Data evento': str}` — prevents pandas from coercing order IDs or timestamps to numeric/datetime types.
-2. Filter to rows where `Stato posto ∈ {'CONFIRMED', 'RESALE', 'CANCELLED'}` — this drops ~288 garbage rows that have other status values.
-3. `pd.to_numeric(df['Posto'], errors='coerce')` — some seat numbers may be non-numeric strings; they become `NaN`.
-4. `dropna` on `['Posto', 'Data evento', 'Settore', 'Fila', 'Settore prezzi']` — drops rows with missing critical fields.
-5. Cast `Posto` to `int`.
+**Changes from old version**: Auto-detects the separator by reading the first line and checking for `;`. This handles both the cleaned CSV (comma-separated) and the raw full report (semicolon-separated).
+
+**Logic**:
+1. Peek at the first line to detect `;` vs `,`.
+2. `pd.read_csv` with `dtype={'Codice ordine': str, 'Data evento': str}` — prevents coercion of IDs to numbers.
+3. Filter to rows where `Stato posto ∈ {'CONFIRMED', 'RESALE', 'CANCELLED'}`.
+4. `pd.to_numeric(df['Posto'], errors='coerce')` — non-numeric seat numbers become `NaN`.
+5. `dropna` on key columns, then cast `Posto` to `int`.
 
 **Called by**: `main()`.
 
 ---
 
-### `resolve_seats(event_df)` — line 62
+### `resolve_seats(event_df)` — line 66
 
-**Purpose**: From a per-event DataFrame (which may have multiple rows per physical seat), determine the true status of every seat.
+**Purpose**: Determine the true status of every physical seat for one event.
 
-**Input**: `event_df` — subset of `tickets` for one event date.
+**Input**: `event_df` — all ticket rows for one event.
 
-**Output**: Two dicts:
-- `occupied: {(settore, fila, posto): (order_id, settore_prezzi)}` — seats with at least one CONFIRMED or RESALE row.
-- `free: {(settore, fila, posto): settore_prezzi}` — seats with only CANCELLED rows (truly unoccupied).
+**Output**:
+- `occupied: {(settore, fila, posto): (order_id, settore_prezzi)}` — seats with any CONFIRMED/RESALE row.
+- `free: {(settore, fila, posto): settore_prezzi}` — seats with only CANCELLED rows.
 
-**Why this is needed**: The CSV can contain multiple rows per physical seat — for example, a CANCELLED row (from a returned ticket) plus a CONFIRMED row (from the repurchase). The rule is: if any CONFIRMED or RESALE row exists for `(settore, fila, posto)`, the seat is occupied, regardless of CANCELLED rows. Only a seat with exclusively CANCELLED rows is truly free.
+**Why needed**: The CSV may have multiple rows per physical seat (e.g., a CANCELLED row from a return plus a CONFIRMED row from a repurchase). The rule: if any CONFIRMED or RESALE row exists for a seat, the seat is occupied regardless of any CANCELLED rows.
 
 **Logic**:
-1. `active` = rows where `Stato posto ∈ OCCUPIED`.
-2. `active_keys` = set of `(settore, fila, posto)` tuples from `active` — the "has any active booking" fingerprint.
-3. `act_dedup` = deduplicate active rows per physical seat (drop_duplicates on the three key columns). For each unique physical seat, take the first row's order ID. This assumes all CONFIRMED/RESALE rows for the same seat belong to the same order — which is the business-rule expectation.
-4. Build `occupied` dict from `act_dedup`.
-5. `canc` = rows where `Stato posto == 'CANCELLED'`.
-6. `canc_dedup` = deduplicate, then keep only those seats whose `(s, f, p)` is **not** in `active_keys`. These are the truly empty seats.
-7. Build `free` dict from the filtered cancelled rows.
+1. `active_keys` = set of `(settore, fila, posto)` triples with at least one CONFIRMED/RESALE row.
+2. Deduplicate active rows by seat — first row's order ID is used (assumes all active rows for a seat belong to the same order).
+3. For CANCELLED rows, only include seats **not** in `active_keys` as free.
 
 **Called by**: `process_event()`.
 
 ---
 
-### `build_segments(occupied, free)` — line 93
+### `build_segments(occupied, free)` — line 97
 
-**Purpose**: Partition seats into independent sub-problems.
+**Purpose**: Partition all seats into independent 1-D sub-problems.
 
 **Input**: `occupied` and `free` dicts from `resolve_seats`.
 
 **Output**: `dict[(settore, fila, sp), {'seats': {posto: order_id}, 'free': set[posto]}]`
 
-**Logic**: Iterates both input dicts. For each occupied seat `(s, f, p)` with order `(oid, sp)`, it adds `posto → oid` to `segs[(s, f, sp)]['seats']`. For each free seat `(s, f, p)` with `sp`, it adds `posto` to `segs[(s, f, sp)]['free']`. `defaultdict` handles first-access initialization.
+**Logic**: Iterates both dicts, routing each seat to the segment keyed by its `(settore, fila, settore_prezzi)` triple.
 
-**Why `(settore, fila, settore_prezzi)` not `(settore, fila)` alone**: A single row may contain seats at different price levels. Swapping a seat across price levels would change the buyer's price category — forbidden. Adding `settore_prezzi` to the segment key enforces this constraint structurally.
+**Why `settore_prezzi` in the key**: A row can contain seats at different price levels. Swapping across price levels changes the buyer's price category — forbidden. Including `settore_prezzi` enforces this constraint structurally.
 
 **Called by**: `process_event()`.
 
 ---
 
-### `contiguous_runs(positions)` — line 112
+### `contiguous_runs(positions)` — line 116
 
 **Purpose**: Decompose a sorted list of integers into maximal consecutive runs.
 
-**Input**: a sorted `list[int]` of seat positions.
+**Input**: sorted `list[int]`.
 
-**Output**: `list[list[int]]` — each inner list is a run of consecutive integers.
+**Output**: `list[list[int]]` — each inner list is a consecutive run.
 
 **Example**: `[1, 2, 3, 5, 6, 10]` → `[[1, 2, 3], [5, 6], [10]]`
 
-**Logic**: Linear pass. Maintain `cur` as the current run. If the next position equals `cur[-1] + 1`, extend `cur`. Otherwise, save `cur` and start a new one.
+**Logic**: Linear scan — extend current run if next position = `prev + 1`, otherwise start a new run.
 
-**Why it exists**: The solver needs to enumerate all length-k windows in the available positions as candidate blocks. These windows can only span within a run — you can't form a consecutive block `[5, 6]` from positions `[5, 10]`. `contiguous_runs` cleanly isolates the reachable sub-ranges.
+**Why needed**: Both the ILP and backtracking solvers enumerate candidate blocks as windows within runs. A window can only span within a run because positions from different runs are not consecutive.
 
-**Called by**: `solve_segment()` once at its start, indirectly via the `candidate_blocks` inner function.
+**Called by**: `solve_segment()` via `get_blocks()` inner function; `_solve_segment_bt()` via `candidate_blocks()` and `simulate_collateral()`.
 
 ---
 
-### `is_adjacent(postos)` — line 127
+### `is_adjacent(postos)` — line 131
 
-**Purpose**: Check whether a list of seat numbers is already consecutive.
+**Purpose**: Check whether a list of seat numbers is consecutive.
 
-**Input**: `list[int]` of seat positions (unsorted).
+**Input**: `list[int]` (unsorted).
 
 **Output**: `bool`
 
-**Logic**: Sort the list. Return `True` if every adjacent pair differs by exactly 1. A list of length ≤ 1 is trivially adjacent.
+**Logic**: Sort, then verify every adjacent pair differs by exactly 1. Single-seat lists return `True`.
 
-**Example**: `is_adjacent([5, 7])` → `False`. `is_adjacent([5, 6, 7])` → `True`.
-
-**Called by**: `solve_segment()` to build `to_fix` — only orders that are in `problematic_set` AND fail `is_adjacent` actually need work.
+**Called by**: `solve_segment()` and `_solve_segment_bt()` to build `to_fix`; `simulate_collateral()` to detect collateral damage; collateral detection in `main()`.
 
 ---
 
-### `solve_segment(seats, free_postos, problematic_set)` — line 136
+### `_pair_seats(old_p, new_p)` — line 140
 
-This is the heart of the algorithm. It is the most complex function and is broken down phase by phase below.
+**Purpose**: Match old seat positions to new seat positions minimising the number of seats that actually move.
 
-**Purpose**: Find the lowest-cost permutation of seats within one segment such that every problematic order's seats become consecutive.
+**Input**: `old_p: list[int]`, `new_p: list[int]` — same-length lists of sorted positions.
+
+**Output**: `list[(old_seat, new_seat)]`
+
+**Logic**:
+1. `kept = set(old_p) & set(new_p)` — seats present in both lists stay fixed (paired with themselves).
+2. `remaining_old` and `remaining_new` = positions not in `kept`, sorted.
+3. Pair remaining by sorted-index zip.
+
+**Why this matters**: The old code used `zip(old_p, new_p)` unconditionally — a sorted positional pairing. That could generate spurious moves. Example: an order at seats [5, 6] reassigned to [5, 7] would previously emit `(5→5, 6→7)`; `_pair_seats` gives the same result here. But for [5, 6] → [4, 6], the old code emits `(5→4, 6→6)` while `_pair_seats` emits `[(6,6), (5,4)]` — seat 6 is recognised as staying in place and only seat 5 moves. This reduces noise in the output.
+
+**Called by**: `solve_segment()` and `_solve_segment_bt()` in their move-emission phases.
+
+---
+
+### `solve_segment(seats, free_postos, problematic_set)` — line 156
+
+This is the primary solver. It formulates and solves an ILP, then falls back to `_solve_segment_bt` if `pulp` is unavailable or the ILP finds no feasible solution.
+
+**Purpose**: Find the globally minimum-cost seat assignment for the entire segment such that every problematic order ends up in a contiguous block.
 
 **Inputs**:
-- `seats: dict[posto, order_id]` — current occupied assignment within the segment.
-- `free_postos: set[posto]` — currently unoccupied positions in the segment.
-- `problematic_set: set[order_id]` — which orders need to be fixed.
+- `seats: dict[posto, order_id]` — current occupied assignment.
+- `free_postos: set[posto]` — free positions in the segment.
+- `problematic_set: set[order_id]` — orders to fix.
 
-**Output**: `(moves, infeasible)` where `moves = [(order_id, old_posto, new_posto), ...]` and `infeasible = [order_id, ...]`.
+**Output**: `(moves, infeasible)`.
 
-#### Phase 1 — Setup
+#### Step 1 — Setup (identical to backtracking path)
 
 ```python
-order_postos: dict = defaultdict(list)
-for pos, oid in seats.items():
-    order_postos[oid].append(pos)
-for oid in order_postos:
-    order_postos[oid].sort()
+order_postos = {oid: sorted(postos)}   # inverted index
+to_fix = {oid for oid in prob. orders that are not adjacent}
+all_pos = sorted(occupied ∪ free)
+runs = contiguous_runs(all_pos)
 ```
 
-Inverts `seats` to produce `order_postos: {order_id: [sorted postos]}`. This is the working representation throughout.
+`get_blocks(k)` inner function: same as old `candidate_blocks(k)` — returns all k-length windows across all runs.
+
+#### Step 2 — Build candidate blocks for every order
 
 ```python
-to_fix = {
-    oid: postos
-    for oid, postos in order_postos.items()
-    if oid in problematic_set and not is_adjacent(postos)
+candidates: dict = {}
+for oid, postos in order_postos.items():
+    blocks = get_blocks(len(postos))
+    if oid in to_fix:
+        orig = tuple(postos)
+        if orig not in blocks:
+            blocks = blocks + [orig]   # dummy option
+    candidates[oid] = blocks
+```
+
+**Critical difference from old approach**: Every order — problematic and non-problematic alike — gets a candidate list. Non-problematic orders' candidates are all contiguous blocks of their size, including their current positions. This is what makes the ILP a joint optimizer: it decides placement for all orders simultaneously.
+
+For problematic orders, the dummy block `orig` (their current non-contiguous seats) is added to the candidate list if it isn't already there. This acts as an "infeasibility escape hatch" — the solver can choose it, but paying `INFEASIBLE_PENALTY`.
+
+#### Step 3 — Define penalty constants
+
+```python
+INFEASIBLE_PENALTY = 1_000_000   # cost of leaving a prob order non-adjacent
+COLL_PENALTY       = 10_000      # cost of moving an already-adjacent non-prob order
+```
+
+The hierarchy ensures the solver prefers, in strict order:
+1. Fix all fixable problematic orders (`INFEASIBLE_PENALTY` avoided).
+2. Leave already-adjacent non-problematic orders undisturbed (`COLL_PENALTY` avoided).
+3. Minimise seat displacement (tiebreaker, integer values).
+
+#### Step 4 — Build ILP variables
+
+```python
+x: dict = {
+    (oid, b): pulp.LpVariable(f"x{oi[oid]}_{bi}", cat="Binary")
+    for oid, blocks in candidates.items()
+    for bi, b in enumerate(blocks)
 }
 ```
 
-`to_fix` is the subset of problematic orders in this segment that are genuinely non-adjacent. Orders already adjacent (or single-seat) are excluded. If `to_fix` is empty, the function returns immediately.
+One binary variable per `(order, candidate_block)` pair. `x[oid, b] = 1` means "order `oid` is assigned to block `b`."
 
+Variable naming uses integer indices (`oi[oid]`, `bi`) rather than raw IDs to avoid character-limit issues in the solver's variable-name handling.
+
+#### Step 5 — Add constraints
+
+**Assignment constraint** (one block per order):
 ```python
-all_pos = sorted(set(seats) | free_postos)
-runs    = contiguous_runs(all_pos)
+for oid, blocks in candidates.items():
+    mdl += pulp.lpSum(x[oid, b] for b in blocks) == 1
 ```
 
-`all_pos` is the universe of available positions (occupied + free). `runs` splits it into consecutive stretches.
-
-#### Phase 2 — Candidate block enumeration (inner function `candidate_blocks`)
-
+**Seat conflict constraint** (at most one order per seat):
 ```python
-def candidate_blocks(k: int) -> list:
-    blocks = []
-    for run in runs:
-        for i in range(len(run) - k + 1):
-            blocks.append(tuple(run[i: i + k]))
-    return blocks
+seat_vars: dict = defaultdict(list)
+for (oid, b), var in x.items():
+    for seat in b:
+        seat_vars[seat].append(var)
+for seat, var_list in seat_vars.items():
+    if len(var_list) > 1:
+        mdl += pulp.lpSum(var_list) <= 1
 ```
 
-Returns every contiguous window of length `k` across all runs. For a run `[10, 11, 12, 13]` with `k=2`, the blocks are `(10,11), (11,12), (12,13)`. A block must be entirely within one run because positions in different runs are not consecutive by definition.
+These two constraint families define the feasible region. The assignment constraint ensures no order is left unplaced. The conflict constraint ensures no physical seat is claimed by two orders simultaneously.
 
-#### Phase 3 — Sort problematic orders largest-first
+Note: the conflict constraint is only added where `len(var_list) > 1` — seats that appear in only one block's variable are trivially conflict-free.
+
+#### Step 6 — Build objective
+
+The objective has three tiers, applied depending on whether the order is problematic, already-adjacent non-problematic, or non-adjacent non-problematic:
 
 ```python
-prob_list = sorted(to_fix.items(), key=lambda x: -len(x[1]))
+# Prob orders
+if oid in to_fix:
+    for b in blocks:
+        if b == orig:
+            obj.append(INFEASIBLE_PENALTY * x[oid, b])    # dummy = stay non-adjacent
+        else:
+            disp = sum(abs(nb - ob) for nb, ob in zip(b, postos))
+            obj.append(disp * x[oid, b])                   # displacement only
+
+# Already-adjacent non-prob orders
+elif is_adjacent(postos) and orig in blocks:
+    for b in blocks:
+        if b != orig:
+            disp = sum(abs(nb - ob) for nb, ob in zip(b, postos))
+            obj.append((COLL_PENALTY + disp) * x[oid, b])  # collateral + displacement
+
+# Non-adjacent non-prob orders (shouldn't happen but tolerated)
+else:
+    centroid = sum(postos) / len(postos)
+    for b in blocks:
+        disp = abs(sum(b) / len(b) - centroid)
+        if disp:
+            obj.append(disp * x[oid, b])                   # centroid displacement only
 ```
 
-Orders with more seats are harder to place (fewer valid k-length windows exist). Placing them first in the search tree causes infeasibility to be detected earlier, enabling aggressive pruning.
+The comment in the code notes that `COLL_PENALTY + disp` as the coefficient for non-original blocks eliminates degenerate circular permutations — every possible assignment gets a unique score, so the solver always picks the assignment that moves the non-prob order the minimum distance from its origin.
 
-#### Phase 4 — Cost function (inner function `step_cost`)
+The third case (non-adjacent non-prob orders) uses centroid displacement because these orders don't have a well-defined "correct" position — the solver moves them as little as possible.
+
+#### Step 7 — Solve
 
 ```python
-def step_cost(block: tuple, old_p: list) -> int:
-    new_p  = sorted(block)
-    disp   = sum(abs(n - o) for n, o in zip(new_p, old_p))
-    evict  = sum(1 for p in block if p in seats and seats[p] not in to_fix)
-    return disp + evict * 100
+mdl.solve(pulp.PULP_CBC_CMD(msg=0, timeLimit=10))
 ```
 
-- `disp`: total displacement — sum of absolute position changes, using sorted-to-sorted pairing. By the rearrangement inequality, this pairing minimizes the sum of absolute differences for any given set of new positions.
-- `evict`: how many non-problematic occupants this block would displace.
-- The 100× weight makes evicting a single non-problematic occupant equivalent to moving an order 100 seats, so the algorithm strongly prefers to use free slots.
+CBC (COIN-BC) is the open-source MIP solver bundled with `pulp`. `msg=0` suppresses solver output. `timeLimit=10` — ten seconds per segment (ten times more than the old 1-second backtracking budget, appropriate given the larger search space the ILP covers).
 
-Note: `seats[p] not in to_fix` checks whether the current occupant at position `p` is a non-problematic order. Evicting a problematic order from its current slot costs nothing extra since we're already reassigning it.
+`mdl.sol_status` codes: `1` = Optimal, `2` = IntegerFeasible (time limit hit but a valid solution was found). Anything else (infeasible, unbounded, error) triggers the backtracking fallback.
 
-#### Phase 5 — Greedy warm-start
+#### Step 8 — Extract solution
 
 ```python
-g_taken: set       = set()
-g_placement: dict  = {}
-for oid, old_p in prob_list:
-    k = len(old_p)
-    centroid = sum(old_p) / k
-    for block in sorted(candidate_blocks(k), key=lambda b: abs(sum(b) / k - centroid)):
-        if not any(p in g_taken for p in block):
-            g_placement[oid] = block
-            g_taken.update(block)
+assignment: dict = {}
+for oid, blocks in candidates.items():
+    for b in blocks:
+        if (pulp.value(x[oid, b]) or 0) > 0.5:
+            assignment[oid] = b
             break
-if len(g_placement) == len(prob_list):
-    g_cost = sum(step_cost(g_placement[oid], old_p) for oid, old_p in prob_list)
-    best['cost']      = g_cost
-    best['placement'] = g_placement
 ```
 
-Iterates problematic orders largest-first. For each, picks the closest available block (by centroid-to-centroid distance) that doesn't overlap already-claimed positions. This is a pure greedy — first-fit by proximity. If all orders are placed, it records the solution in `best`.
+For each order, scan its blocks and pick the one whose variable is closest to 1. The `> 0.5` threshold handles floating-point noise in the solver's binary variable values.
 
-**Why this matters**: The greedy solution seeds `best['cost']`. The branch-and-bound then prunes any branch where `partial_cost >= best['cost']`. A good warm-start eliminates vast portions of the search tree.
-
-If the greedy fails to place all orders (some couldn't find a non-overlapping block), `len(g_placement) < len(prob_list)`, the `if` doesn't trigger, and `best['cost']` stays `inf`. The backtracker then starts completely unguided.
-
-#### Phase 6 — Branch-and-bound backtracking (inner function `backtrack`)
+#### Step 9 — Identify infeasible orders
 
 ```python
-def backtrack(idx: int, taken: set, placement: dict, partial_cost: int):
-    if time.time() > deadline:
-        return
-    if partial_cost >= best['cost']:
-        return
-
-    if idx == len(prob_list):
-        if partial_cost < best['cost']:
-            best['cost']      = partial_cost
-            best['placement'] = dict(placement)
-        return
-
-    oid, old_p = prob_list[idx]
-    k          = len(old_p)
-    centroid   = sum(old_p) / k
-
-    blocks = sorted(
-        candidate_blocks(k),
-        key=lambda b: abs(sum(b) / k - centroid),
-    )[:MAX_BRANCHES]
-
-    for block in blocks:
-        if any(p in taken for p in block):
-            continue
-        cost_here = step_cost(block, old_p)
-        if partial_cost + cost_here >= best['cost']:
-            continue
-        placement[oid] = block
-        backtrack(idx + 1, taken | set(block), placement, partial_cost + cost_here)
-        del placement[oid]
+infeasible = [oid for oid in to_fix
+              if assignment.get(oid) == tuple(order_postos[oid])]
 ```
 
-The recursive function places one order per level (`idx` is the depth). Pruning happens at two points:
-1. **Time limit**: `time.time() > deadline` — 1 second per segment.
-2. **Cost bound**: `partial_cost >= best['cost']` — cuts branches that can't beat the current best.
+A problematic order is infeasible if the solver assigned it to its own dummy block (original non-contiguous positions). This means the `INFEASIBLE_PENALTY` was unavoidable — no contiguous block could be found for it without violating seat-conflict constraints.
 
-For each level, it tries up to `MAX_BRANCHES=25` candidate blocks, sorted by proximity to the order's current centroid. Overlap with already-placed orders is checked via `taken`. When all orders are placed (`idx == len(prob_list)`), if the total cost is better than `best['cost']`, the solution is recorded.
-
-`taken | set(block)` creates a new set each call (functional style), so backtracking is clean — when the recursive call returns, `taken` is unchanged. `placement` is mutated in-place and cleaned up with `del placement[oid]` after each recursive call.
-
-**Called with**: `backtrack(0, set(), {}, 0)` — empty initial state.
-
-#### Phase 7 — Build new full assignment
-
-After search, `best['placement']` maps each problematic order to its chosen block.
+#### Step 10 — Build `new_asgn` and emit moves
 
 ```python
-prob_taken = {p for postos in best['placement'].values() for p in postos}
-```
-
-All positions claimed by problematic orders.
-
-**Step 1** — Problematic orders at their chosen new positions:
-```python
-for oid, postos in best['placement'].items():
-    for p in postos:
+new_asgn: dict = {}
+for oid, b in assignment.items():
+    for p in b:
         new_asgn[p] = oid
+for oid, postos in order_postos.items():    # safety fallback
+    if oid not in assignment:
+        for p in postos:
+            new_asgn[p] = oid
 ```
 
-**Step 2** — Non-problematic orders whose seats were not touched stay in place:
-```python
-for pos, oid in seats.items():
-    if oid not in to_fix and pos not in prob_taken:
-        new_asgn[pos] = oid
-```
-
-**Step 3** — Non-problematic orders with evicted seats get the nearest remaining positions:
-```python
-remaining = sorted(p for p in all_pos if p not in new_asgn)
-for oid, old_p in order_postos.items():
-    if oid in to_fix:
-        continue
-    n_evicted = sum(1 for p in old_p if p in prob_taken)
-    if n_evicted == 0:
-        continue
-    centroid = sum(old_p) / len(old_p)
-    remaining.sort(key=lambda p: abs(p - centroid))
-    for p in remaining[:n_evicted]:
-        new_asgn[p] = oid
-    remaining = remaining[n_evicted:]
-```
-
-For each evicted non-problematic order, sorts remaining open positions by distance from the order's centroid and takes the `n_evicted` closest ones. This is greedy — it processes orders one at a time without coordinating across them.
-
-#### Phase 8 — Emit moves
+Invert to `{order_id: [sorted new postos]}`, then compare old and new per order via `_pair_seats`:
 
 ```python
-inv: dict = defaultdict(list)
-for pos, oid in new_asgn.items():
-    inv[oid].append(pos)
-for oid in inv:
-    inv[oid].sort()
-
-moves = []
 for oid, old_p in order_postos.items():
     new_p = inv.get(oid, old_p)
-    for old, new in zip(old_p, new_p):
-        if old != new:
+    if set(old_p) != set(new_p):
+        for old, new in _pair_seats(old_p, new_p):
             moves.append((oid, old, new))
 ```
 
-Inverts `new_asgn` to get `{order_id: [sorted new postos]}`. Then for each order, pairs old sorted positions with new sorted positions via `zip` and emits a move for every changed seat.
+The `set(old_p) != set(new_p)` check skips orders whose seat-set didn't change (set comparison, not list comparison — order of seats doesn't matter).
+
+**Called by**: `process_event()`.
 
 ---
 
-### `process_event(event_df, problematic)` — line 293
+### `_solve_segment_bt(seats, free_postos, problematic_set)` — line 319
 
-**Purpose**: Orchestrate processing for one event: resolve seats, build segments, detect globally infeasible orders, invoke segment solver.
+This is the old backtracking solver, now a fallback. Its structure is similar to the original but with several important refinements.
 
-**Inputs**:
-- `event_df`: all ticket rows for this event.
-- `problematic: set[order_id]`: orders that need fixing for this event.
+**Purpose**: Place each problematic order in a contiguous block via branch-and-bound backtracking, then greedily reassign non-problematic orders. Used when `pulp` is absent or the ILP fails.
 
-**Output**: `(all_moves, all_infeasible)` — combined results from all segments.
+**Inputs/Output**: same interface as `solve_segment`.
 
-**Logic**:
-1. `resolve_seats(event_df)` → `occupied`, `free`.
-2. `build_segments(occupied, free)` → `segments`.
-3. **Cross-segment detection**: For each segment, for each problematic order in that segment, record which segments that order appears in (`order_segments`). If an order appears in more than one segment key, it is `globally_infeasible` — its seats span different `(settore, fila, sp)` combinations, which cannot be made adjacent without violating constraints.
-4. `fixable = problematic - globally_infeasible`.
-5. For each segment: skip it if it contains no fixable orders. Otherwise call `solve_segment(seg['seats'], seg['free'], fixable)`.
-6. Collect moves and infeasible lists. Moves are enriched with settore/fila/sp metadata here (the solver returns only order/old_posto/new_posto).
+#### Key differences from the original backtracking solver
+
+**1. Lexicographic objective — collateral is the primary criterion**
+
+```python
+best: dict = {'collateral': float('inf'), 'displacement': float('inf'), 'placement': None}
+```
+
+The old solver minimised a combined `displacement + 100 * evictions` scalar. The backtracking fallback now minimises `(collateral, displacement)` lexicographically — collateral first, displacement as tiebreaker. "Collateral" means the number of previously-adjacent non-problematic orders that become non-adjacent after the reallocation.
+
+**2. `simulate_collateral(placement)` — line 367**
+
+```python
+def simulate_collateral(placement: dict) -> int:
+```
+
+Called at every leaf of the search tree to evaluate a complete candidate placement. It simulates the full non-problematic order reassignment (the same greedy loop used in the final assignment phase) and counts how many originally-adjacent non-prob orders end up non-adjacent in that simulation.
+
+This is expensive (O(N log N) per leaf) but necessary: collateral damage cannot be predicted from displacement alone because it depends on which non-prob orders get evicted and whether contiguous slots remain for them.
+
+**3. `record_if_better(placement, displacement)` — line 412**
+
+```python
+def record_if_better(placement: dict, displacement: int):
+    coll = simulate_collateral(placement)
+    if (coll < best['collateral'] or
+            (coll == best['collateral'] and displacement < best['displacement'])):
+        best['collateral']  = coll
+        best['displacement'] = displacement
+        best['placement']   = dict(placement)
+```
+
+Updates `best` using the lexicographic comparison. Replaces the old direct cost comparison.
+
+**4. Modified pruning condition**
+
+```python
+if best['collateral'] == 0 and partial_cost >= best['displacement']:
+    return
+```
+
+The old solver pruned any branch where `partial_cost >= best['cost']`. The new solver only prunes on displacement when the current best has zero collateral — otherwise it would incorrectly discard branches that might reduce collateral even at higher displacement.
+
+**5. Non-problematic order reassignment tries contiguous blocks first**
+
+```python
+best_block = None
+best_dist  = float('inf')
+for run in contiguous_runs(rem_list):
+    for i in range(len(run) - k + 1):
+        block = tuple(run[i: i + k])
+        d = abs(sum(block) / k - centroid)
+        if d < best_dist:
+            best_dist  = d
+            best_block = block
+
+if best_block is None:
+    # No contiguous block available — take k nearest individual seats
+    rem_list.sort(key=lambda p: abs(p - centroid))
+    best_block = tuple(rem_list[:k]) if len(rem_list) >= k else tuple(rem_list)
+```
+
+The old solver just sorted by centroid distance and took the `n_evicted` nearest individual seats. The fallback now explicitly searches for the nearest **contiguous** block, falling back to individual seat assignment only when no contiguous block exists. This directly reduces the collateral damage the solver produces.
+
+**6. Displaced non-prob orders get priority**
+
+```python
+displaced_np = sorted(
+    [(oid, op) for oid, op in order_postos.items()
+     if oid not in to_fix and any(p in prob_taken for p in op)],
+    key=lambda x: -len(x[1]),    # largest displaced first
+)
+intact_np = sorted(
+    [(oid, op) for oid, op in order_postos.items()
+     if oid not in to_fix and all(p not in prob_taken for p in op)],
+    key=lambda x: (-len(x[1]), min(x[1])),    # largest first, then by position
+)
+for oid, old_p in displaced_np + intact_np:
+    ...
+```
+
+Orders that lost seats to the prob placement are processed first — they have lost seats and urgently need a new contiguous block. Intact orders follow and will naturally reclaim their original positions if still available.
+
+**7. Infeasible orders stay in place explicitly**
+
+```python
+for oid in infeasible:
+    for p in to_fix[oid]:
+        new_asgn[p] = oid
+```
+
+In the old code, infeasible orders' seats could be claimed by the non-prob repair loop. Now they are locked into `new_asgn` before the repair loop runs.
+
+**8. Double fallback**
+
+```python
+if best['placement'] is None:
+    taken_fb: set = set()
+    best['placement'] = {}
+    for oid, old_p in prob_list:
+        ...greedy...
+```
+
+If backtracking finds no placement at all (very rare — would require the greedy warm-start to also fail), a second greedy pass runs independently. This prevents `best['placement']` from being `None` downstream.
+
+---
+
+### `process_event(event_df, problematic)` — line 552
+
+**Purpose**: Orchestrate per-event processing.
+
+**Logic**: Unchanged from the old version except one small addition: moves where `old_p == new_p` get `Stato = 'COINVOLTO'` instead of `'SPOSTATO'`.
+
+```python
+'Stato': 'SPOSTATO' if old_p != new_p else 'COINVOLTO',
+```
+
+`'COINVOLTO'` marks orders that were included in the optimizer's assignment (and thus appear in the output) but whose seat did not actually change number. This can happen when the ILP re-assigns an order to a block that happens to contain its original seat.
 
 **Called by**: `main()`.
 
 ---
 
-### `main()` — line 340
+### `main()` — line 599
 
-**Purpose**: Top-level entry point — load, process, write output.
+**Purpose**: Entry point with two output modes.
 
-**Logic**:
-1. `load_tickets('report_cleaned.csv')` → `tickets` DataFrame. Print row count.
-2. `parse_orders('orders.txt')` → `orders_by_event` dict.
-3. `tickets.groupby('Data evento')` — iterate over events. For each event with problematic orders, call `process_event`. Stamp each move dict with `Data evento`.
-4. After all events: build infeasible rows — for each infeasible `(event_date, order_id)`, look up the order's actual current seats in the `tickets` DataFrame and emit rows with `Stato = 'NON RISOLVIBILE'` and `Posto originale == Posto nuovo` (no move, just a marker).
-5. Write `reallocation.xlsx` with `pd.ExcelWriter`, one sheet per event. Sheet names are sanitized (colons → dots, slashes → hyphens, truncated to 31 chars — Excel's limit).
-6. Print final summary.
+#### New: argument parsing
 
-**Output columns**: `['Codice ordine', 'Settore', 'Fila', 'Settore prezzi', 'Posto originale', 'Posto nuovo', 'Stato']`. `Data evento` is excluded from columns because it is already encoded in the sheet name.
+```python
+parser.add_argument('--full-report', metavar='PATH', ...)
+```
+
+Without `--full-report`: reads `data/report_cleaned.csv`, writes `data/reallocation.xlsx` (moved/infeasible seats only, plus optional `COLLATERALE` sheet).
+
+With `--full-report PATH`: reads the full raw report at `PATH`, annotates every row with `Nuovo posto` and `Stato`, writes `data/report_annotated.xlsx`.
+
+#### New: collateral detection (lines 647–685)
+
+After all events are processed, a post-processing pass identifies collateral orders — those that were originally adjacent but became non-adjacent after reallocation. This works across both output modes.
+
+```python
+for event_date, event_active in active.groupby('Data evento'):
+    # Reconstruct final seat state by applying all moves
+    orig: dict = defaultdict(list)     # original seats per order
+    final: dict = {oid: list(ps) ...}  # copy that gets moves applied
+
+    for m in moves_by_event[event_date]:
+        oid = m['Codice ordine']
+        # Remove old seat, add new seat
+        if op in final[oid]: final[oid].remove(op)
+        if np_ not in final[oid]: final[oid].append(np_)
+
+    for oid, orig_ps in orig.items():
+        if (event_date, oid) in infeasible_set: continue
+        if not is_adjacent(orig_ps) or is_adjacent(final[oid]): continue
+        # was adjacent, now isn't → collateral
+        collateral_rows.append({..., 'Stato': 'COLLATERALE'})
+```
+
+The detection condition `not is_adjacent(orig_ps) or is_adjacent(final[oid])` reads: "skip if originally non-adjacent (already broken, not collateral) OR if still adjacent after (no damage)." Only orders that were adjacent before and non-adjacent after are flagged.
+
+#### Full-report mode (lines 687–782)
+
+Reads the full CSV again, joins the move results on `(Data evento, Codice ordine, posto_num)`, and annotates each row with `Nuovo posto` (the seat's new number) and `Stato` (`SPOSTATO`, `COINVOLTO`, `NON RISOLVIBILE`, or `NON COINVOLTO`).
+
+Uses a pandas left-merge rather than a row loop, so even very large CSVs are handled efficiently. Drops temporary `_` columns before writing.
+
+#### Summary mode (lines 784–833, default)
+
+Same as the old behaviour: writes only moved and infeasible seats to `data/reallocation.xlsx`, plus the `COLLATERALE` sheet if any collateral orders were found.
 
 ---
 
 ## 4. Execution flow trace
 
-**Scenario**: Event `2026-05-30 21:00:00.0`. The output shows a 3-way rotation among orders `3410490`, `3417618`, and `3420777` in segment `(Settore B, -, PRIMO SETTORE NUMERATO)`:
+**Scenario**: Event `2026-05-30 21:00:00.0`. Two problematic orders in segment `(Settore B, -, PRIMO SETTORE NUMERATO)`:
 
-```
-3410490: seat 59 → 65
-3417618: seat 55 → 59
-3420777: seat 65 → 55
-```
+- Order `3417618`: seats [55, 65] — non-adjacent.
+- Order `3420777`: seats [63, 68] — non-adjacent (hypothetical).
+- Order `3410490`: seats [59] — single seat, non-problematic.
+- Free positions in the segment: 56, 57, 60, 61, 64, 66, 67.
 
-**Step 1 — `load_tickets`**
+**Step 1 — `main` calls `process_event`**
 
-The CSV is read. Rows for the three orders above have `Stato posto = CONFIRMED` and survive the filter. `Posto` is cast to int.
+`resolve_seats` maps each physical seat to its occupant. `build_segments` puts all seats in `(Settore B, -, PRIMO SETTORE NUMERATO)`.
 
-**Step 2 — `parse_orders`**
+Cross-segment check: both problematic orders appear in only this one segment → `globally_infeasible = {}`, `fixable = {3417618, 3420777}`.
 
-Line 1 of `orders.txt`: `"2026-05-30 21:00:00.0: ['3417618', '3419185', ...]"` → `{'3417618', '3419185', ...}`. Order `3410490` is not in this set — it is a non-problematic order.
-
-**Step 3 — `main` iterates events**
-
-`tickets.groupby('Data evento')` yields the 2026-05-30 group. `problematic = {'3417618', ...}` — the 17 orders from the file.
-
-**Step 4 — `process_event`**
-
-`resolve_seats(event_df)`:
-- Seat `(Settore B, -, 55)` → CONFIRMED by `3417618`.
-- Seat `(Settore B, -, 65)` → CONFIRMED by `3420777` (hypothetically, its second seat alongside another).
-- Seat `(Settore B, -, 59)` → CONFIRMED by `3410490`.
-
-`build_segments`: All three land in `(Settore B, -, PRIMO SETTORE NUMERATO)` → `seats = {55: '3417618', 65: '3420777', 59: '3410490', ...}`.
-
-Cross-segment check: `3417618` and `3420777` each appear in only one segment → `globally_infeasible = {}`. Both are `fixable`.
-
-**Step 5 — `solve_segment`**
+**Step 2 — `solve_segment` is called**
 
 `order_postos`:
-- `3417618`: [55, 65] (non-adjacent — `to_fix`)
-- `3420777`: [65, ...] (non-adjacent — `to_fix`)
-- `3410490`: [59] (single seat — adjacent, not in `to_fix`)
+```
+3417618 → [55, 65]   (in to_fix: non-adjacent)
+3420777 → [63, 68]   (in to_fix: non-adjacent)
+3410490 → [59]       (not in to_fix: single seat, already adjacent)
+```
 
-`all_pos` includes 55, 59, 65 and surrounding free positions. `prob_list` sorted by size.
+`all_pos = [55, 56, 57, 59, 60, 61, 63, 64, 65, 66, 67, 68]`
+`runs = [[55,56,57], [59,60,61], [63,64,65,66,67,68]]`
 
-**Greedy warm-start**: Places `3417618` at the closest available 2-block to centroid 60. Say `(59, 60)` — but 59 is occupied by `3410490` (eviction cost +100). Tries `(60, 61)` if free. Continues until a valid block is found.
+`candidates` built:
+- `3417618`: all 2-length blocks + dummy `(55,65)`. Blocks include `(55,56)`, `(56,57)`, `(59,60)`, `(60,61)`, `(63,64)`, ..., plus dummy `(55,65)`.
+- `3420777`: all 2-length blocks + dummy `(63,68)`.
+- `3410490`: all 1-length blocks = `[(55,), (56,), ..., (68,)]`.
 
-**Backtracking**: Explores if placing `3417618` at `(55, 56)` (displacement=10+9=19, 0 evictions) and `3420777` at `(64, 65)` (displacement=1+0=1, 0 evictions) beats the greedy solution. Whichever placement minimizes total cost becomes `best`.
+**Step 3 — ILP variables and constraints**
 
-In the actual output, the solver chose to rotate the three orders (3-way swap), meaning placing `3417618` at `(59, 60)` or similar caused `3410490` to be evicted from 59 and reassigned to 65 (vacated by `3420777`'s move).
+~30 variables created (one per `(order, block)` pair). Three assignment constraints (one per order). Seat conflict constraints for positions like 55, 56, 63, 64, 65 etc. where multiple blocks overlap.
 
-**Phase 7 — Assignment**:
-- `3417618` → positions from `best['placement']`
-- `3420777` → positions from `best['placement']`
-- `3410490` (evicted from 59) → nearest remaining position: 65
+**Step 4 — Objective**
 
-**Phase 8 — Moves emitted**:
-- `(3417618, 55, 59)`, `(3420777, 65, 55)`, `(3410490, 59, 65)`
+For `3417618`:
+- `(55,65)` dummy → coefficient `1_000_000`
+- `(55,56)` → displacement `|55-55| + |56-65| = 9`
+- `(56,57)` → displacement `|56-55| + |57-65| = 9`
+- `(59,60)` → displacement `|59-55| + |60-65| = 9` (evicts `3410490` from 59, but that's not directly penalized in the ILP — `3410490`'s `COLL_PENALTY` handles it)
+- ...
 
-**Step 6 — Back in `main`**
+For `3410490` (single seat, adjacent):
+- `(59,)` → 0 (no cost for staying in place)
+- Any other position → `COLL_PENALTY + |new - 59|`
 
-Moves get `Data evento = '2026-05-30 21:00:00.0'` stamped. After all events, `reallocation.xlsx` written with one sheet per event.
+**Step 5 — CBC solves**
+
+CBC finds the optimal assignment: perhaps `3417618 → (63,64)`, `3420777 → (65,66)`, `3410490 → (59,)` — zero displacement for `3410490`, and both problematic orders fixed.
+
+**Step 6 — Assignment extracted**
+
+Both problematic orders get contiguous blocks. `3410490` stays at 59.
+
+**Step 7 — Move emission**
+
+```
+3417618: old=[55,65], new=[63,64] → _pair_seats → [(55→63), (65→64)]
+3420777: old=[63,68], new=[65,66] → _pair_seats → [(63→65), (68→66)]
+3410490: old=[59], new=[59] → set unchanged, no move emitted
+```
+
+**Step 8 — Back in `main`**, collateral detection runs, no collateral found, output written.
 
 ---
 
 ## 5. Decision logic
 
-### How candidates are evaluated: `step_cost`
+### ILP objective hierarchy
 
-```
-cost = Σ|new_pos_i - old_pos_i|  +  100 × (# non-problematic orders evicted)
-```
+The three-tier cost structure enforces a strict priority ordering:
 
-- Displacement is measured by pairing sorted new positions with sorted old positions. By the rearrangement inequality, this pairing minimizes the sum of absolute differences.
-- The 100× multiplier on evictions ensures: "moving an order even 99 positions is preferable to evicting one innocent bystander." In practice, segments rarely span 100 seats, so eviction is truly a last resort.
+| Priority | Condition | Cost assigned |
+|---|---|---|
+| 1st | Prob order cannot be fixed → dummy block chosen | `INFEASIBLE_PENALTY = 1,000,000` |
+| 2nd | Adjacent non-prob order is moved | `COLL_PENALTY + displacement = 10,000+` |
+| 3rd | Prob order displacement | `displacement` (integer, bounded by segment size) |
+| 3rd | Non-adjacent non-prob order centroid shift | `centroid distance` (float, secondary tiebreaker) |
 
-### How the algorithm chooses among alternatives
+Because penalties are strictly larger than any realistic displacement value (segments are hundreds of seats at most), the solver never trades a collateral damage for displacement savings. The hierarchy is mathematically enforced, not just heuristic.
 
-The backtracker explores candidate blocks sorted by `|centroid_of_block - centroid_of_order|` — proximity first. This means the search tree is ordered best-first at each level. Combined with branch-and-bound pruning (`partial_cost >= best['cost']`), the algorithm tends to find the optimal solution quickly without exhaustively exploring distant candidates.
+### How candidate blocks are enumerated
+
+`get_blocks(k)` / `candidate_blocks(k)` enumerate all k-length windows within contiguous runs. For the ILP, **all** blocks are added to the model (no `MAX_BRANCHES` cap). This is exact: the ILP considers every possible contiguous placement, not just the 25 closest by centroid as the backtracking did.
 
 ### Constraints enforced
 
-| Constraint | Enforcement mechanism |
+| Constraint | Enforcement |
 |---|---|
-| Same sector/row/price | Structural — segment decomposition makes cross-constraint moves impossible |
-| Consecutive seats only | `candidate_blocks` only produces windows from contiguous runs |
-| No position overlap | `taken` set in `backtrack` + `any(p in taken for p in block)` check |
-| Cross-segment orders rejected | `globally_infeasible` check in `process_event` before any solver call |
+| Same sector/row/price | Structural — segment decomposition |
+| Consecutive seats only | `get_blocks`/`candidate_blocks` only produces windows from runs |
+| No two orders share a seat | ILP seat-conflict constraint (`lpSum(seat_vars[seat]) <= 1`) |
+| Cross-segment orders rejected | `globally_infeasible` check in `process_event` |
+| Infeasible orders stay in place | ILP: dummy block with original seats; BT: explicit lock in `new_asgn` |
 
-### How conflicts are resolved
+### How the ILP handles infeasibility
 
-The branch-and-bound naturally resolves conflicts: if two problematic orders both want the same block, only one branch assigns it to the first order, and the other must pick another block. Both branches are explored (up to `MAX_BRANCHES`), and the winner is whichever minimizes total cost.
+The ILP is always **feasible by construction** — even if no contiguous block exists for a problematic order, the dummy block `orig` is always available. The solver never returns "infeasible"; it returns a solution where some prob orders chose their dummy block (paying `INFEASIBLE_PENALTY`). Infeasibility detection is post-hoc:
 
-### Scoring and prioritization
+```python
+infeasible = [oid for oid in to_fix
+              if assignment.get(oid) == tuple(order_postos[oid])]
+```
 
-- **Largest orders first** in `prob_list` — maximizes early pruning.
-- **Closest-first block ordering** within the search — maximizes probability that the first valid complete assignment is near-optimal.
-- **Greedy warm-start** seeds a strong initial upper bound — the backtracker typically only has to verify it can't do better, pruning most branches immediately.
+### Backtracking fallback pruning
+
+The fallback prunes only when `best['collateral'] == 0` — meaning we have found at least one zero-collateral solution. Until then, all branches continue (we can't discard branches that might reduce collateral). Once a zero-collateral solution exists, displacement pruning (`partial_cost >= best['displacement']`) activates. This is a weaker pruning condition than the old flat cost prune, meaning the fallback explores more of the tree — acceptable given it's only invoked when the ILP fails.
 
 ---
 
@@ -544,93 +709,92 @@ The branch-and-bound naturally resolves conflicts: if two problematic orders bot
 
 ### `tickets: pd.DataFrame`
 
-Flat, row-per-ticket structure. Columns: `Codice ordine, Stato ordine, Stato posto, Data evento, Item, Settore, Fila, Posto, Settore prezzi`. Used only for initial loading and filtering. After `groupby('Data evento')`, each group is passed to `process_event` and not touched directly again.
+Flat row-per-ticket DataFrame. After `load_tickets`, filtered to valid statuses with `Posto` as `int`. Grouped by `Data evento` in `main`.
 
-### `occupied: {(settore, fila, posto): (order_id, settore_prezzi)}`
+### `occupied / free` dicts
 
-Dict keyed by physical seat identity (3-tuple). Value carries the owner order and price category. Uniquely identifies every occupied seat in an event and who owns it.
+```
+occupied: {(settore, fila, posto): (order_id, settore_prezzi)}
+free:     {(settore, fila, posto): settore_prezzi}
+```
 
-### `free: {(settore, fila, posto): settore_prezzi}`
-
-Same key structure as `occupied`. Contains only genuinely unoccupied seats (not blocked by any CONFIRMED/RESALE). Value is just `settore_prezzi` to allow correct segment assignment.
+Physical seat → ownership/availability mapping. Tuple keys uniquely identify a physical seat. Used only within `process_event` to build segments.
 
 ### `segments: {(settore, fila, sp): {'seats': {posto: order_id}, 'free': set[posto]}}`
 
-The core decomposition. Each segment is self-contained. `seats` maps position (int) to order ID. `free` is a set of available positions. The solver operates exclusively on `seats` and `free` — no knowledge of other segments is required.
+The problem decomposition. Each segment is fully self-contained. The solver sees only `seats` and `free` — no other segment's data.
 
-### `order_postos: {order_id: [sorted postos]}`
+### `candidates: {order_id: list[tuple[posto, ...]]}`
 
-Inverted index within a segment. Built at the start of `solve_segment` by inverting `seats`. Allows O(1) lookup of where an order currently sits. Sorted to enable correct position pairing in move emission.
+Built in `solve_segment`. For each order (prob and non-prob), all contiguous k-length blocks in the segment, plus the dummy block for prob orders. This is the full decision set for the ILP.
 
-### `to_fix: {order_id: [postos]}`
+### `x: {(order_id, block_tuple): LpVariable}`
 
-Subset of `order_postos` — only orders that are both in `problematic_set` and not already adjacent. The target list for the solver.
+The ILP variables. Binary — 1 if the order is assigned to that block, 0 otherwise. After solving, exactly one variable per order will be 1.
 
-### `best: {'cost': float, 'placement': dict}`
+### `seat_vars: {posto: list[LpVariable]}`
 
-Shared mutable closure state for the branch-and-bound. Tracks the best complete solution found so far. Updated whenever `backtrack` finds a strictly better assignment. The `dict(placement)` copy on update is essential — without it, the mutable `placement` dict would corrupt the stored solution as the search continues.
+Index for building seat-conflict constraints. Maps each position to all `x` variables whose block contains that position.
 
-### `placement: {order_id: tuple[posto, ...]}`
+### `best: dict` (ILP path)
 
-Partial assignment built up during backtracking. Mutated in-place (`placement[oid] = block` / `del placement[oid]`) for efficiency. The `del` is the explicit backtracking step.
+Not used in the ILP path — the ILP directly produces the optimal `assignment` dict. `best` is only used in `_solve_segment_bt`.
 
-### `taken: set[posto]`
+### `best: dict` (backtracking fallback)
 
-Immutable per call — a new set is created via `taken | set(block)` at each level. This functional style ensures the parent call's `taken` is unchanged after a recursive call returns, making the backtracking clean without explicit undo.
+```python
+{'collateral': float, 'displacement': float, 'placement': dict}
+```
+
+Tracks the best complete solution found. Updated via `record_if_better` using lexicographic comparison. `placement: {order_id: block_tuple}` is deep-copied (`dict(placement)`) on every update.
 
 ### `new_asgn: {posto: order_id}`
 
-Final seat assignment after solving. Built in three sequential passes: (1) problematic orders, (2) un-evicted non-problematic, (3) evicted non-problematic. Then inverted to `inv` for move computation.
+Final seat assignment after the solver. Built in three phases in the backtracking path (prob orders, infeasible orders, non-prob orders), or directly from `assignment` in the ILP path. Inverted to emit moves.
 
-### `remaining: list[posto]`
+### `collateral_rows: list[dict]`
 
-Mutable list of unassigned positions, re-sorted by centroid distance for each evicted non-problematic order. Shrinks as positions are assigned out.
+Post-processing result from `main`. Each entry describes one order that was adjacent before reallocation and non-adjacent after. Written to the `COLLATERALE` sheet in the output.
 
 ---
 
 ## 7. Weak points and complexity hotspots
 
-### 1. Evicted non-problematic orders may themselves become scattered
+### 1. ILP model size grows quadratically with segment size
 
-The repair phase assigns the nearest available positions to evicted orders. But "nearest" is per-order greedy and does not consider whether the evicted order's remaining (un-evicted) seats are still adjacent.
+The number of variables is `Σ_orders (number_of_k_blocks_for_order)`. For a dense segment with N seats and many orders of size k, `get_blocks(k)` can return O(N) blocks per order, and there are O(N/k) orders, giving O(N²/k) variables. For large events (hundreds of seats per row, many problematic orders), this can produce models with thousands of variables, which may approach or exceed the 10-second time limit.
 
-**Example**: Order A has seats [10, 11, 12]. The solver evicts seat 11 for a problematic order. Repair assigns seat 20 as the nearest available. Now order A sits at [10, 12, 20] — scattered. This is not caught or corrected. The order will not appear in future runs unless explicitly listed in `orders.txt`.
+### 2. Fallback to `_solve_segment_bt` is silent
 
-### 2. `MAX_BRANCHES = 25` is a hard approximation cap
+When the ILP fails (`mdl.sol_status not in (1, 2)`), the code silently calls `_solve_segment_bt`. There is no logging of which segments fell back, making it hard to diagnose quality differences or detect segments that are consistently forcing the fallback.
 
-If the optimal block placement for an order is the 26th closest block by centroid distance, it will never be found. In segments with many occupied seats and little free space, the globally optimal solution may be missed. The greedy warm-start helps by bounding cost, but the backtracker still cannot search beyond position 25 in the candidate list.
+### 3. `simulate_collateral` is O(N log N) per backtracking leaf
 
-### 3. Greedy warm-start can fail silently
+In `_solve_segment_bt`, `simulate_collateral` is called at every complete placement found by `backtrack`. It simulates the entire non-prob assignment loop (sorting, run-finding, block selection). For a segment with many non-prob orders, this can be slow. The 1-second time limit mitigates this, but the fallback may produce fewer explored leaves than the old solver.
 
-If the greedy cannot place all orders (first-fit conflicts), `len(g_placement) < len(prob_list)` and `best['cost']` stays `inf`. The backtracker then starts with no upper bound. Depending on the search space size and the 1-second limit, it may or may not find an optimal solution before timing out.
+### 4. Non-prob orders in the ILP use centroid-distance cost, not block-level displacement
 
-### 4. `candidate_blocks` is re-evaluated at every backtrack level
+For non-adjacent non-prob orders (third tier in the objective), the cost coefficient is `abs(sum(b)/len(b) - centroid)` — the distance between the centroid of block `b` and the centroid of the original seats. This is a proxy for displacement, not the exact sum of absolute differences. It can mismatch: two blocks with the same centroid distance but different individual seat displacements receive the same cost. This is a deliberate simplification (centroid is cheap and good enough for the tiebreaker role), but it means the ILP may not find the absolute minimum displacement for non-adjacent non-prob orders.
 
-`candidate_blocks(k)` is called fresh at every level of `backtrack`. Since `runs` is a closure from the outer scope and never changes during search, the result is always the same for a given `k`. Caching it by `k` (e.g., with a dict or `lru_cache`) would be a trivial optimization. In practice this is fast because segment sizes are small, but it is a hidden redundancy.
+### 5. `_pair_seats` pairing is still an approximation for non-prob orders
 
-### 5. `order_segments` detection is O(segments × seats_per_segment)
+`_pair_seats` keeps seats that appear in both old and new lists, then zips remaining positions by sorted index. For an order that moves from [5, 6, 7] to [5, 8, 9], it returns `[(5,5), (6,8), (7,9)]`. This is correct. But for [5, 6] → [6, 7], it keeps 6 in place and maps 5→7 — which is the minimum-moves interpretation but not necessarily the physical swap intention (the person at seat 5 could move to seat 7 while the person at seat 6 stays, or both could slide right by one). The output represents one valid permutation, not necessarily the physically simplest one.
 
-The loop in `process_event` that maps each problematic order to its set of segment keys iterates every segment and every seat within it. For a large event, this is O(S × N). In practice fine, but not immediately obvious.
+### 6. Collateral detection is a post-hoc check, not an optimization input for the ILP
 
-### 6. Move emission uses positional pairing by sorted rank
+The ILP objective penalizes moving already-adjacent non-prob orders via `COLL_PENALTY`. But `COLL_PENALTY` is charged per order moved, while collateral means an order that ends up non-adjacent — which can happen even if the order moves as a whole intact block (if it's moved to a position where it's surrounded by other moved orders). In very dense segments, an order might be moved while still ending up non-adjacent even in its new position, and the ILP would charge `COLL_PENALTY` without preventing this. Collateral detection catches these cases after the fact.
 
-In the final step, old and new positions for each order are paired by sorted index:
-```python
-for old, new in zip(old_p, new_p):
-```
-This is mathematically correct for minimizing total displacement (rearrangement inequality), but it means the move record `(oid, 55, 59)` says "the seat at position 55 in the old assignment becomes position 59 in the new assignment" — not necessarily that the specific physical ticket was swapped. Consumers of the output should understand this is a positional re-labeling, not a per-ticket tracking record.
+### 7. The `COLL_PENALTY + disp` coefficient is applied per-order, not per-seat
 
-### 7. Excel sheet name collision risk
+The ILP charges `COLL_PENALTY + disp` as the cost coefficient on `x[oid, b]` for non-prob adjacent orders when `b != orig`. But `disp` here is `sum(abs(nb - ob) for nb, ob in zip(b, postos))` — total displacement for the entire order. For a large order (e.g., 6 seats), the displacement component is larger, which could cause the solver to prefer moving large adjacent non-prob orders less than small ones, even if the total seat-count disruption is the same. This is unlikely to matter in practice but is a non-obvious asymmetry.
 
-Sheet names are derived as `str(event_date).replace(':', '.').replace('/', '-')[:31]`. Two distinct event date strings that produce identical sanitized names (within 31 chars) would silently collide. In practice, event dates are distinct timestamps, so this is unlikely but not guarded against.
+### 8. Excel sheet name collision risk
 
-### 8. `fixable` is event-level, passed to segment-level solver
+Sheet names derived as `str(event_date).replace(':', '.').replace('/', '-')[:31]` could collide if two event dates differ only in characters that map to the same replacement and share the same 31-character prefix. Unguarded — a collision would cause a runtime error from `openpyxl`.
 
-`fixable` (the event-wide set of order IDs that are not globally infeasible) is passed directly to `solve_segment` as `problematic_set`. The solver narrows it correctly because `order_postos` is built from `seg['seats']`, which only contains orders present in that segment. So the cross-segment filtering is implicit rather than explicit — correct, but non-obvious to a reader.
+### 9. Full-report merge on `(Data evento, Codice ordine, posto_num)` assumes unique rows
 
-### 9. Partially evicted non-problematic multi-seat orders become scattered
-
-If an order has seats [5, 6, 7] and only seat 6 is evicted (`n_evicted=1`), the repair assigns one new position elsewhere. The order ends up with seats [5, new_pos, 7] — non-consecutive. The solver's eviction cost (`evict * 100`) tries to avoid this scenario, but when eviction is unavoidable, the greedy repair does not maintain adjacency for non-problematic orders and does not trigger any follow-up fix.
+In full-report mode, the move DataFrame is left-merged onto the big DataFrame on three columns. If the original report has duplicate rows for the same `(event, order, seat)` combination, the merge will produce multiple rows per move, inflating counts. The deduplication in `resolve_seats` prevents the solver from seeing duplicates, but the full-report annotation operates on the raw file directly.
 
 ---
 
@@ -640,31 +804,46 @@ If an order has seats [5, 6, 7] and only seat 6 is evicted (`n_evicted=1`), the 
 |---|---|---|
 | `OCCUPIED` | `{'CONFIRMED', 'RESALE'}` | Seat statuses that count as taken |
 | `VALID` | `{'CONFIRMED', 'RESALE', 'CANCELLED'}` | Statuses kept after CSV filter |
-| `MAX_BRANCHES` | `25` | Max candidate blocks tried per order per backtrack level |
-| Time limit | `1.0` s | Per-segment backtracking budget (`deadline = time.time() + 1.0`) |
-| Eviction weight | `100` | Penalty multiplier for displacing a non-problematic occupant |
+| `MAX_BRANCHES` | `25` | Max candidate blocks per order per backtrack level (fallback only) |
+| ILP time limit | `10` s | Per-segment CBC budget (`timeLimit=10`) |
+| BT time limit | `1.0` s | Per-segment backtracking budget (`deadline = time.time() + 1.0`) |
+| `INFEASIBLE_PENALTY` | `1,000,000` | ILP cost for leaving a prob order non-adjacent (unfixable) |
+| `COLL_PENALTY` | `10,000` | ILP cost for displacing an already-adjacent non-prob order |
+
+## Appendix: Output status values
+
+| `Stato` value | Meaning |
+|---|---|
+| `SPOSTATO` | Seat was moved to a new number |
+| `COINVOLTO` | Order was in the optimizer's assignment but seat number did not change |
+| `NON RISOLVIBILE` | Order could not be made adjacent (cross-segment or no valid block) |
+| `COLLATERALE` | Order was adjacent before but non-adjacent after (post-hoc detection) |
+| `NON COINVOLTO` | Seat was not affected by any reallocation (full-report mode only) |
 
 ## Appendix: Input/output formats
 
-### `report_cleaned.csv`
+### `data/report_cleaned.csv`
 
 ```
-Codice ordine, Stato ordine, Stato posto, Data evento, Item, Settore, Fila, Posto, Settore prezzi
-3406628, REGULAR, CONFIRMED, 2026-06-27 21:00:00.0, ..., Prato Gold, GA, 3, PRATO GOLD
+Codice ordine,Stato ordine,Stato posto,Data evento,Item,Settore,Fila,Posto,Settore prezzi
+3406628,REGULAR,CONFIRMED,2026-06-27 21:00:00.0,...,Prato Gold,GA,3,PRATO GOLD
 ```
 
-### `orders.txt`
+Separator auto-detected (`;` or `,`).
+
+### `data/orders.txt`
 
 ```
 2026-05-30 21:00:00.0: ['3417618', '3419185', ...]
 2026-06-06 20:30:00.0: ['3406711', '3407635', ...]
 ```
 
-One line per event. Format is a Python list literal after the colon.
+One line per event. Python list literal after the colon.
 
-### `reallocation.xlsx`
+### `data/reallocation.xlsx` (default mode)
 
-One sheet per event. Columns: `Codice ordine, Settore, Fila, Settore prezzi, Posto originale, Posto nuovo, Stato`.
+One sheet per event. Columns: `Codice ordine, Settore, Fila, Settore prezzi, Posto originale, Posto nuovo, Stato`. Optional `COLLATERALE` sheet.
 
-- `Stato = 'SPOSTATO'` — seat was successfully moved.
-- `Stato = 'NON RISOLVIBILE'` — order could not be fixed; row shows current seat with no change.
+### `data/report_annotated.xlsx` (`--full-report` mode)
+
+One sheet per event containing every row of the source file, with two added columns (`Nuovo posto`, `Stato`) inserted after `Posto`. Optional `COLLATERALE` sheet.

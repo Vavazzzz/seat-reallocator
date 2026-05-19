@@ -172,6 +172,7 @@ def solve_segment(seats: dict, free_postos: set, problematic_set: set) -> tuple:
     try:
         import pulp
     except ImportError:
+        print("WARNING: pulp not available, falling back to backtracking solver (may be slow and suboptimal)", flush=True)
         return _solve_segment_bt(seats, free_postos, problematic_set)
 
     order_postos: dict = defaultdict(list)
