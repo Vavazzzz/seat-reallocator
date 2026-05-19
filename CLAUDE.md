@@ -21,7 +21,22 @@ There are no tests and no linter configuration.
 
 ## Architecture
 
-The entire algorithm lives in one file: [reallocate.py](reallocate.py). See [ARCHITECTURE.md](ARCHITECTURE.md) for a deep function-by-function walkthrough.
+The algorithm lives in the `seat_reallocator/` package. `reallocate.py` is a thin entry point. See [ARCHITECTURE.md](ARCHITECTURE.md) for a full walkthrough.
+
+```
+seat_reallocator/
+    config.py       all constants and tuning parameters
+    io.py           CSV loading, orders-file parsing
+    geometry.py     contiguous_runs, is_adjacent, pair_seats
+    seats.py        resolve_seats, build_segments
+    engine.py       process_event, detect_collateral
+    reporter.py     write_reallocation_report, write_full_report
+    cli.py          main() + argparse
+    solver/
+        base.py     SegmentSolver ABC
+        ilp.py      ILPSolver (primary — pulp/CBC)
+        backtrack.py BacktrackSolver (fallback)
+```
 
 ### Problem
 
@@ -29,36 +44,44 @@ Concert ticket orders sometimes have seats scattered across a row (e.g., seats 3
 
 ### Decomposition
 
-Each `(Settore, Fila, Settore prezzi)` triple is an independent 1-D subproblem. Orders whose seats span multiple triples are immediately flagged `NON RISOLVIBILE` — they cannot be fixed under the constraints.
+Each `(Settore, Fila, Settore prezzi)` triple is an independent 1-D subproblem. Orders whose seats span multiple triples are immediately flagged `NON RISOLVIBILE`.
 
-### Solver (`solve_segment`)
+### Primary solver (`ILPSolver`)
 
-The core is a **greedy warm-start + branch-and-bound** over contiguous block placements:
+An Integer Linear Program that jointly optimises all orders in a segment. One binary variable per `(order, candidate-block)` pair. Three-tier objective (penalty magnitudes enforce strict priority):
+1. Fix all problematic orders (`INFEASIBLE_PENALTY = 1 000 000` if skipped).
+2. Leave already-adjacent non-prob orders undisturbed (`COLL_PENALTY = 10 000` if displaced).
+3. Minimise total seat displacement (integer tiebreaker).
 
-1. **Greedy warm-start** — places each problematic order at the nearest non-overlapping contiguous block (by centroid distance). Seeds `best` with an initial upper bound.
-2. **Backtracking** — explores up to `MAX_BRANCHES=25` candidate blocks per order per level, pruning on cost. Hard time limit: **1 second per segment**.
-3. **Objective** — lexicographic `(collateral, displacement)`: the search minimizes the number of previously-adjacent non-prob orders that become non-adjacent first, then minimizes total seat displacement.
-4. **`simulate_collateral`** — called at each backtracking leaf to count collateral damage for a candidate placement, enabling the solver to prefer chain-displacement solutions over ones that scatter innocent orders.
-5. **Non-prob assignment** — after prob orders are placed, all non-prob orders share a pool. Displaced orders (those with any seat in `prob_taken`) are assigned first (largest first), then intact orders reclaim their original seats.
-6. **Fallback** — if backtracking finds no solution (timeout, no valid blocks), a greedy fallback assigns individual orders independently.
+Falls back to `BacktrackSolver` if `pulp` is unavailable or the ILP finds no solution.
 
-### Output (`reallocation.xlsx`)
+### Fallback solver (`BacktrackSolver`)
+
+Greedy warm-start + branch-and-bound, `MAX_BRANCHES = 25` per level, `BT_TIME_LIMIT = 1.0 s` budget. Minimises `(collateral, displacement)` lexicographically.
+
+### Output
 
 One sheet per event date (colon→dot, slash→dash in sheet name), plus an optional `COLLATERALE` sheet.
 
 | `Stato` value | Meaning |
 |---|---|
 | `SPOSTATO` | Seat successfully moved |
+| `COINVOLTO` | Order in optimizer's assignment but seat number unchanged |
 | `NON RISOLVIBILE` | Order infeasible (cross-segment seats, or no valid contiguous block found) |
 | `COLLATERALE` | Order was adjacent before but non-adjacent after (collateral from dense segment) |
+| `NON COINVOLTO` | Seat unaffected (full-report mode only) |
 
 ### Key constants
 
-| Constant | Location | Effect |
+All in [`seat_reallocator/config.py`](seat_reallocator/config.py). Tuning any solver parameter requires editing only that file.
+
+| Constant | Default | Effect |
 |---|---|---|
-| `MAX_BRANCHES = 25` | top of file | Candidate blocks tried per order per backtrack level — raise to improve quality at cost of speed |
-| Time limit `1.0s` | `solve_segment` | Per-segment backtracking budget — raise if segments time out too early |
-| `OCCUPIED` / `VALID` | top of file | Seat statuses treated as taken / kept after CSV filter |
+| `MAX_BRANCHES` | 25 | Candidate blocks per order per backtrack level (BT only) |
+| `ILP_TIME_LIMIT` | 10 s | Per-segment CBC budget |
+| `BT_TIME_LIMIT` | 1.0 s | Per-segment backtracking budget |
+| `INFEASIBLE_PENALTY` | 1 000 000 | ILP cost for leaving a prob order non-adjacent |
+| `COLL_PENALTY` | 10 000 | ILP cost for displacing an already-adjacent non-prob order |
 
 ### Input data format
 
