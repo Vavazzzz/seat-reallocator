@@ -8,14 +8,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # Activate the virtual environment (Python 3.14, dependencies: pandas, openpyxl, numpy)
 .venv\Scripts\activate
 
-# Run the seat reallocator
-python reallocate.py
+# Run the seat reallocator (auto-detects non-consecutive orders)
+python reallocate.py data/report.csv
 
-# Prepare a fresh report_cleaned.csv from a raw report.csv export
-python clean.py
+# Override auto-detection with a manual orders file
+python reallocate.py data/report.csv --orders data/orders.txt
+
+# Override output path (default: data/report_annotated.xlsx)
+python reallocate.py data/report.csv --out data/my_output.xlsx
 ```
 
-`reallocate.py` must be run from the project root (`c:\dev\seat-reallocator\`). It reads from `data/report_cleaned.csv` and `data/orders.txt`, and writes `reallocation.xlsx` to the project root. `clean.py` reads `report.csv` and writes `report_cleaned.csv` at the root — if you use it, move the output to `data/` before running `reallocate.py`.
+`reallocate.py` must be run from the project root (`c:\dev\seat-reallocator\`). It reads the raw report CSV, auto-detects problematic orders, and writes the annotated full report to `data/report_annotated.xlsx`.
 
 There are no tests and no linter configuration.
 
@@ -85,6 +88,8 @@ All in [`seat_reallocator/config.py`](seat_reallocator/config.py). Tuning any so
 
 ### Input data format
 
-**`data/report_cleaned.csv`** — columns: `Codice ordine, Stato ordine, Stato posto, Data evento, Item, Settore, Fila, Posto, Settore prezzi`. Separator auto-detected (`,` or `;`). Rows where `Stato posto ∉ {CONFIRMED, RESALE, CANCELLED}` are filtered out. A seat with any CONFIRMED/RESALE row is treated as occupied; one with only CANCELLED rows is treated as free.
+**`data/report.csv`** — raw report export. Required columns: `Codice ordine, Stato ordine, Stato posto, Data evento, Item, Settore, Fila, Posto, Settore prezzi`. Optional: `Selezione in mappa` (rows with value `true` are excluded). Separator auto-detected (`,` or `;`). Rows where `Fila == "GA"` (General Admission) or `Stato posto ∉ {CONFIRMED, RESALE, CANCELLED}` are filtered out. A seat with any CONFIRMED/RESALE row is treated as occupied; one with only CANCELLED rows is treated as free.
 
-**`data/orders.txt`** — one line per event, format: `"2026-05-30 21:00:00.0: ['order_id_1', 'order_id_2', ...]"` (Python list literal). Only orders listed here are targeted for fixing, but chain displacements may move non-listed adjacent orders to make room.
+Non-consecutive orders are auto-detected: an order is problematic if, within any `Settore prezzi` group, its seats span multiple `Settore`, multiple `Fila`, or non-consecutive `Posto` values.
+
+**`data/orders.txt`** (optional override) — one line per event, format: `"2026-05-30 21:00:00.0: ['order_id_1', 'order_id_2', ...]"` (Python list literal). Pass via `--orders` to bypass auto-detection.
