@@ -2,8 +2,8 @@ import argparse
 import time
 
 from .config import OCCUPIED
-from .io import load_tickets, parse_orders, detect_non_consecutive_orders
-from .engine import process_event, detect_collateral
+from .io import load_tickets, parse_orders
+from .engine import process_event, detect_collateral, detect_non_consecutive_orders
 from .reporter import write_full_report
 
 

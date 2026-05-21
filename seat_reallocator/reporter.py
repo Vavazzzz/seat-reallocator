@@ -1,5 +1,3 @@
-from collections import defaultdict
-
 import pandas as pd
 
 from .config import OCCUPIED
@@ -9,32 +7,11 @@ _MOVE_COLS = [
     'Posto originale', 'Posto nuovo', 'Stato',
 ]
 
-_DEFAULT_REALLOCATION_PATH = 'data/reallocation.xlsx'
-_DEFAULT_ANNOTATED_PATH    = 'data/report_annotated.xlsx'
+_DEFAULT_ANNOTATED_PATH = 'data/report_annotated.xlsx'
 
 
 def _sheet_name(event_date: str) -> str:
     return str(event_date).replace(':', '.').replace('/', '-')[:31]
-
-
-def write_reallocation_report(
-    all_rows: list,
-    collateral_rows: list,
-    path: str = _DEFAULT_REALLOCATION_PATH,
-) -> None:
-    """
-    Write the summary report (moved + infeasible seats only), one sheet per event.
-    Writes nothing if all_rows is empty.
-    """
-    if not all_rows:
-        return
-    df_all = pd.DataFrame(all_rows)
-    with pd.ExcelWriter(path, engine='openpyxl') as writer:
-        for event_date, group in df_all.groupby('Data evento'):
-            group[_MOVE_COLS].to_excel(writer, sheet_name=_sheet_name(event_date), index=False)
-        if collateral_rows:
-            df_coll = pd.DataFrame(collateral_rows)
-            df_coll[_MOVE_COLS].to_excel(writer, sheet_name='COLLATERALE', index=False)
 
 
 def write_full_report(
