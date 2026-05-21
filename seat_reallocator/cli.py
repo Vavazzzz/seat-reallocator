@@ -50,6 +50,7 @@ def main():
 
         for m in moves:
             m['Data evento'] = event_date
+
         all_moves.extend(moves)
         all_infeasible.extend((event_date, oid) for oid in infeasible)
 

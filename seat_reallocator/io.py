@@ -19,15 +19,23 @@ def parse_orders(path: str) -> dict:
 
 
 def load_tickets(path: str) -> pd.DataFrame:
-    with open(path, 'r', encoding='utf-8-sig') as f:
-        first = f.readline()
-    sep = ';' if ';' in first else ','
-    df = pd.read_csv(
-        path,
-        sep=sep,
-        low_memory=False,
-        dtype={'Codice ordine': str, 'Data evento': str},
-    )
+    if path.lower().endswith(('.xlsx', '.xls')):
+        sheets = pd.read_excel(
+            path,
+            sheet_name=None,
+            dtype={'Codice ordine': str, 'Data evento': str},
+        )
+        df = pd.concat(sheets.values(), ignore_index=True)
+    else:
+        with open(path, 'r', encoding='utf-8-sig') as f:
+            first = f.readline()
+        sep = ';' if ';' in first else ','
+        df = pd.read_csv(
+            path,
+            sep=sep,
+            low_memory=False,
+            dtype={'Codice ordine': str, 'Data evento': str},
+        )
     df = df[df['Fila'].astype(str).str.upper() != 'GA']
     df = df[df['Stato posto'].isin(VALID)].copy()
     df['Posto'] = pd.to_numeric(df['Posto'], errors='coerce')
