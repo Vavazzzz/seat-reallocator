@@ -20,7 +20,8 @@ import time
 import pandas as pd
 
 from seat_reallocator.config import OCCUPIED
-from seat_reallocator.io import load_tickets, detect_non_consecutive_orders
+from seat_reallocator.io import load_tickets
+from seat_reallocator.engine import detect_non_consecutive_orders
 from seat_reallocator.engine import process_event, detect_collateral
 from seat_reallocator.reporter import write_full_report
 

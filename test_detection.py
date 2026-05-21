@@ -13,7 +13,8 @@ import ast
 import sys
 
 from seat_reallocator.config import OCCUPIED
-from seat_reallocator.io import load_tickets, detect_non_consecutive_orders
+from seat_reallocator.io import load_tickets
+from seat_reallocator.engine import detect_non_consecutive_orders
 
 
 def parse_reference(path: str) -> dict[str, set[str]]:
