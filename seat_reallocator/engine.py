@@ -93,8 +93,19 @@ def detect_collateral(
             if np_ not in final[oid]:
                 final[oid].append(np_)
 
+        # Pre-compute the segment key for each order so we can skip multi-row orders.
+        order_segments_local: dict = {}
+        for _, row in event_active.iterrows():
+            oid = row['Codice ordine']
+            key = (row['Settore'], row['Fila'], row['Settore prezzi'])
+            order_segments_local.setdefault(oid, set()).add(key)
+
         for oid, orig_ps in orig.items():
             if (event_date, oid) in infeasible_set:
+                continue
+            # Adjacency is only meaningful within a single (Settore, Fila, Settore prezzi).
+            # Orders spanning multiple rows can never be "adjacent" in any valid sense.
+            if len(order_segments_local.get(oid, set())) > 1:
                 continue
             if not is_adjacent(orig_ps) or is_adjacent(final[oid]):
                 continue
