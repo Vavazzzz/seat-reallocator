@@ -1,5 +1,6 @@
 import pandas as pd
 
+from .config import OCCUPIED
 from .geometry import is_adjacent
 
 _CAPOFILA_PATTERN = 'capofila'
@@ -26,34 +27,301 @@ def _detect_sides(event_df: pd.DataFrame) -> dict:
     return result
 
 
-def _bilateral_donor(occupied_local, settore, target_row, keep_side, all_cap, infeasible_set):
+def _capofila_slice_valid(seats) -> bool:
+    """A capofila row-slice is valid if empty, single, or a contiguous run."""
+    return is_adjacent(sorted(seats))
+
+
+def _donor_slice_valid_after_swap(
+    occupied_local, donor_oid, settore, all_cap,
+    lose_row, lose_pos,
+    gain_row=None, gain_pos=None,
+) -> bool:
     """
-    For Type A: check that every position in keep_side at target_row belongs to
-    the same single order, and that order holds *exactly* keep_side seats in that row.
-    Returns (donor_oid, donor_sp) or None.
+    Check that donor_oid's capofila row-slices remain valid after the proposed swap:
+    donor loses (settore, lose_row, lose_pos) and optionally gains (settore, gain_row, gain_pos).
     """
-    donor_oid = donor_sp = None
-    for pos in keep_side:
-        entry = occupied_local.get((settore, target_row, pos))
-        if entry is None:
+    def _cap_seats_at(row):
+        return frozenset(
+            p for p in all_cap
+            if str(occupied_local.get((settore, row, p), (None,))[0]) == donor_oid
+        )
+
+    new_lose_slice = _cap_seats_at(lose_row) - {lose_pos}
+    if not _capofila_slice_valid(new_lose_slice):
+        return False
+
+    if gain_row is None:
+        return True
+
+    new_gain_slice = (
+        new_lose_slice | {gain_pos}
+        if gain_row == lose_row
+        else _cap_seats_at(gain_row) | {gain_pos}
+    )
+    return _capofila_slice_valid(new_gain_slice)
+
+
+def _try_full_side_move(
+    occupied_local, infeasible_set, oid_str,
+    settore, fila, target_row, sp, side_seats, all_cap, event_date,
+):
+    """
+    Move `side_seats` from (settore, fila) to (settore, target_row) at the same positions.
+    Each occupied target position's holder swaps back to fila at the same position.
+
+    Validates atomically via a proposed-state copy; mutates occupied_local only on success.
+    Returns (order_moves, donor_moves) or None.
+    """
+    side_sorted = sorted(side_seats)
+
+    # Gather donors (one per seat position)
+    seat_donors = {}
+    for pos in side_sorted:
+        key = (settore, target_row, pos)
+        if key in occupied_local:
+            d_oid = str(occupied_local[key][0])
+            d_sp  = occupied_local[key][1]
+            if d_oid == oid_str or d_oid in infeasible_set or d_sp != sp:
+                return None
+            seat_donors[pos] = (d_oid, d_sp)
+
+    # Build proposed state for atomic validation
+    proposed = dict(occupied_local)
+    for pos in side_sorted:
+        del proposed[(settore, fila, pos)]
+        if pos in seat_donors:
+            del proposed[(settore, target_row, pos)]
+            proposed[(settore, fila, pos)] = seat_donors[pos]
+        proposed[(settore, target_row, pos)] = (oid_str, sp)
+
+    # Validate every donor's slices in the proposed state
+    checked = set()
+    for pos, (d_oid, _) in seat_donors.items():
+        if d_oid in checked:
+            continue
+        checked.add(d_oid)
+        for row in (fila, target_row):
+            slc = frozenset(
+                p for p in all_cap
+                if str(proposed.get((settore, row, p), (None,))[0]) == d_oid
+            )
+            if not _capofila_slice_valid(slc):
+                return None
+
+    # Apply
+    occupied_local.clear()
+    occupied_local.update(proposed)
+
+    order_moves = [
+        _cross_move(event_date, oid_str, settore, fila, target_row, sp, pos, pos)
+        for pos in side_sorted
+    ]
+    donor_moves = [
+        _cross_move(event_date, d_oid, settore, target_row, fila, d_sp, pos, pos)
+        for pos, (d_oid, d_sp) in seat_donors.items()
+    ]
+    return order_moves, donor_moves
+
+
+def _try_single_seat_move(
+    occupied_local, infeasible_set, oid_str,
+    settore, fila, target_row, sp, src_pos, all_cap, event_date,
+):
+    """
+    Move one seat from (fila, src_pos) to (target_row, src_pos).
+    If occupied: donor swaps back to (fila, src_pos).
+    Returns (order_moves, donor_moves) or None.
+    """
+    key = (settore, target_row, src_pos)
+    donor_info = None
+
+    if key in occupied_local:
+        d_oid = str(occupied_local[key][0])
+        d_sp  = occupied_local[key][1]
+        if d_oid == oid_str or d_oid in infeasible_set or d_sp != sp:
             return None
-        oid_val, sp_val = str(entry[0]), entry[1]
-        if donor_oid is None:
-            donor_oid, donor_sp = oid_val, sp_val
-        elif oid_val != donor_oid:
+        if not _donor_slice_valid_after_swap(
+            occupied_local, d_oid, settore, all_cap,
+            lose_row=target_row, lose_pos=src_pos,
+            gain_row=fila,       gain_pos=src_pos,
+        ):
+            return None
+        donor_info = (d_oid, d_sp)
+
+    # Apply
+    del occupied_local[(settore, fila, src_pos)]
+    if donor_info:
+        del occupied_local[(settore, target_row, src_pos)]
+        occupied_local[(settore, fila, src_pos)] = (donor_info[0], donor_info[1])
+    occupied_local[(settore, target_row, src_pos)] = (oid_str, sp)
+
+    order_move = _cross_move(
+        event_date, oid_str, settore, fila, target_row, sp, src_pos, src_pos,
+    )
+    donor_moves = (
+        [_cross_move(event_date, donor_info[0], settore, target_row, fila,
+                     donor_info[1], src_pos, src_pos)]
+        if donor_info else []
+    )
+    return [order_move], donor_moves
+
+
+def _resolve_cross_side(
+    occupied_local, infeasible_set, oid_str, settore, fila, sp,
+    majority_seats_sorted, target_side, all_cap, event_date, search_rows,
+):
+    """
+    Move each majority seat to any free or swap-valid position in target_side.
+    Processes seats one at a time, updating state incrementally.
+    Donor swap: donor at (target_row, target_pos) receives (fila, src_pos).
+    Rolls back fully on failure.
+    Returns (order_moves, donor_moves) or None.
+    """
+    snapshot = dict(occupied_local)
+    order_moves: list = []
+    donor_moves: list = []
+
+    for src_pos in majority_seats_sorted:
+        placed = False
+        for target_row in search_rows:
+            for target_pos in sorted(target_side):
+                # Skip positions this order already holds in target_row
+                oid_in_target = frozenset(
+                    p for p in all_cap
+                    if str(occupied_local.get((settore, target_row, p), (None,))[0]) == oid_str
+                )
+                if target_pos in oid_in_target:
+                    continue
+
+                key = (settore, target_row, target_pos)
+                donor_info = None
+
+                if key in occupied_local:
+                    d_oid = str(occupied_local[key][0])
+                    d_sp  = occupied_local[key][1]
+                    if d_oid == oid_str or d_oid in infeasible_set or d_sp != sp:
+                        continue
+                    if not _donor_slice_valid_after_swap(
+                        occupied_local, d_oid, settore, all_cap,
+                        lose_row=target_row, lose_pos=target_pos,
+                        gain_row=fila,       gain_pos=src_pos,
+                    ):
+                        continue
+                    donor_info = (d_oid, d_sp)
+
+                # Apply step
+                del occupied_local[(settore, fila, src_pos)]
+                if donor_info:
+                    del occupied_local[(settore, target_row, target_pos)]
+                    occupied_local[(settore, fila, src_pos)] = (donor_info[0], donor_info[1])
+                occupied_local[(settore, target_row, target_pos)] = (oid_str, sp)
+
+                if target_row == fila:
+                    order_moves.append(_inrow_move(
+                        event_date, oid_str, settore, fila, sp, src_pos, target_pos,
+                    ))
+                    if donor_info:
+                        donor_moves.append(_inrow_move(
+                            event_date, donor_info[0], settore, fila, donor_info[1],
+                            target_pos, src_pos,
+                        ))
+                else:
+                    order_moves.append(_cross_move(
+                        event_date, oid_str, settore, fila, target_row, sp,
+                        src_pos, target_pos,
+                    ))
+                    if donor_info:
+                        donor_moves.append(_cross_move(
+                            event_date, donor_info[0], settore, target_row, fila,
+                            donor_info[1], target_pos, src_pos,
+                        ))
+                placed = True
+                break
+            if placed:
+                break
+
+        if not placed:
+            occupied_local.clear()
+            occupied_local.update(snapshot)
             return None
 
-    if donor_oid in infeasible_set:
-        return None
+    return order_moves, donor_moves
 
-    donor_seats_in_row = {
-        p for p in all_cap
-        if str(occupied_local.get((settore, target_row, p), (None,))[0]) == donor_oid
-    }
-    if donor_seats_in_row != set(keep_side):
-        return None
 
-    return donor_oid, donor_sp
+def _resolve_4seat(
+    occupied_local, infeasible_set, oid_str, settore, fila, sp,
+    left_side, right_side, all_cap, event_date, candidate_rows,
+):
+    """
+    4-seat order: try moving one full side (left or right) to each adjacent row.
+    Returns (order_moves, donor_moves) or None.
+    """
+    for move_side in (left_side, right_side):
+        for target_row in candidate_rows:
+            result = _try_full_side_move(
+                occupied_local, infeasible_set, oid_str,
+                settore, fila, target_row, sp, move_side, all_cap, event_date,
+            )
+            if result is not None:
+                return result
+    return None
+
+
+def _resolve_3seat(
+    occupied_local, infeasible_set, oid_str, settore, fila, sp,
+    seats, left_side, right_side, all_cap, event_date, candidate_rows,
+):
+    """
+    3-seat order — three strategies in priority order:
+
+    S1 — move each minority seat to the same position in an adjacent row.
+         Simplest fix: minority seat vacates current row, lands in neighbour.
+
+    S2 — move the full majority side to an adjacent row (same positions).
+         Valid only when order holds the complete majority side.
+
+    S3 — cross-side: move majority seats into the opposite side's positions
+         (same row first, then adjacent), using single-seat-accepting donors.
+
+    Returns (order_moves, donor_moves) or None.
+    """
+    left_seats  = seats & left_side
+    right_seats = seats & right_side
+
+    if len(left_seats) >= len(right_seats):
+        majority_side, majority_seats = left_side,  left_seats
+        minority_side, minority_seats = right_side, right_seats
+    else:
+        majority_side, majority_seats = right_side, right_seats
+        minority_side, minority_seats = left_side,  left_seats
+
+    # S1: move each minority seat to same position in adjacent row
+    for minority_pos in sorted(minority_seats):
+        for target_row in candidate_rows:
+            result = _try_single_seat_move(
+                occupied_local, infeasible_set, oid_str,
+                settore, fila, target_row, sp, minority_pos, all_cap, event_date,
+            )
+            if result is not None:
+                return result
+
+    # S2: move the full majority side to adjacent row
+    if majority_seats == majority_side:
+        for target_row in candidate_rows:
+            result = _try_full_side_move(
+                occupied_local, infeasible_set, oid_str,
+                settore, fila, target_row, sp, majority_side, all_cap, event_date,
+            )
+            if result is not None:
+                return result
+
+    # S3: cross-side — move majority seats into minority-side positions
+    return _resolve_cross_side(
+        occupied_local, infeasible_set, oid_str, settore, fila, sp,
+        sorted(majority_seats), minority_side, all_cap, event_date,
+        [fila] + list(candidate_rows),
+    )
 
 
 def fix_capofila_orders(
@@ -63,44 +331,51 @@ def fix_capofila_orders(
     event_date: str,
 ) -> tuple:
     """
-    Post-process NON RISOLVIBILE Capofila orders.
+    Post-process NON RISOLVIBILE Capofila orders via cross-row reallocation.
 
-    Aisle seat positions are detected dynamically from data (lower-half = left,
-    upper-half = right within each Settore prezzi group).
+    Success condition: after the fix each row-slice of the resolved order is a
+    contiguous run (single seat, left pair, or right pair). The order may span
+    multiple rows; that is intentional and acceptable.
 
-    Two strategies tried per order, in order:
+    4-seat orders ({L1,L2,R1,R2}):
+      Move one complete side to an adjacent row. Donors at target positions swap
+      back to the vacated side in the problem row. Validated atomically.
 
-    1. SEAT-BY-SEAT — each minority seat placed individually in an adjacent row (±1):
-       a. Target slot free → place directly.
-       b. Target occupied, donor relocates to a free slot within the same row
-          without breaking its own adjacency.
-       c. Target occupied, donor is a single-seat order → donor takes the
-          problem order's vacated seat (cross-row swap of one seat pair).
-
-    2. BILATERAL GROUP SWAP (only when minority and majority are equal size) —
-       The entire minority group moves to the majority-side positions of an
-       adjacent row, while the order occupying those positions (which must be a
-       single order holding exactly that set of seats) swaps into the now-freed
-       minority positions in the problem row.
-
-    Only rows immediately adjacent (±1) are considered. occupied_local is rolled
-    back on failure so subsequent orders see clean state.
+    3-seat orders ({L1,L2,Rm} or {Lm,R1,R2}):
+      S1 — move minority seat to same position in adjacent row
+      S2 — move full majority side to adjacent row
+      S3 — cross-side: relocate majority seats into the opposite side
 
     Returns:
-        capofila_moves:   list of move dicts (Data evento already set)
+        capofila_moves:   list of move dicts
         still_infeasible: list of order IDs that could not be resolved
     """
     capofila_moves:   list = []
     still_infeasible: list = []
-    occupied_local = dict(occupied)
-    sides_cache = _detect_sides(event_df)
-    infeasible_set = {str(oid) for oid in infeasible_ids}
+    occupied_local   = dict(occupied)
+    sides_cache      = _detect_sides(event_df)
+    infeasible_set   = {str(oid) for oid in infeasible_ids}
+
+    # Pre-cache valid capofila rows per settore
+    rows_in_sector: dict = {}
+    for (settore, _) in sides_cache:
+        if settore not in rows_in_sector:
+            rows_in_sector[settore] = set(
+                event_df[
+                    (event_df['Settore'] == settore) &
+                    event_df['Settore prezzi'].str.contains(
+                        _CAPOFILA_PATTERN, case=False, na=False,
+                    )
+                ]['Fila'].astype(int)
+            )
 
     for oid in infeasible_ids:
         oid_str = str(oid)
+
         order_rows = event_df[
             (event_df['Codice ordine'] == oid_str) &
-            event_df['Settore prezzi'].str.contains(_CAPOFILA_PATTERN, case=False, na=False)
+            event_df['Settore prezzi'].str.contains(_CAPOFILA_PATTERN, case=False, na=False) &
+            event_df['Stato posto'].isin(OCCUPIED)
         ]
         if order_rows.empty:
             still_infeasible.append(oid)
@@ -120,256 +395,43 @@ def fix_capofila_orders(
             continue
 
         left_side, right_side, all_cap = sides_cache[sides_key]
-        left_seats  = seats & left_side
-        right_seats = seats & right_side
 
-        if len(left_seats) >= len(right_seats):
-            keep_side = left_side
-            to_move   = sorted(right_seats)
-        else:
-            keep_side = right_side
-            to_move   = sorted(left_seats)
-
-        if not to_move:
+        # Verify all order seats are present in occupied_local
+        if not all((settore, fila, s) in occupied_local for s in seats):
             still_infeasible.append(oid)
             continue
 
-        rows_in_sp = set(
-            event_df[
-                (event_df['Settore'] == settore) &
-                event_df['Settore prezzi'].str.contains(_CAPOFILA_PATTERN, case=False, na=False)
-            ]['Fila'].astype(int)
-        )
-        candidate_rows = [r for r in [fila - 1, fila + 1] if r in rows_in_sp]
+        valid_rows     = rows_in_sector.get(settore, set())
+        candidate_rows = [r for r in (fila - 1, fila + 1) if r in valid_rows]
 
         snapshot = dict(occupied_local)
 
-        # ── Attempt 1: seat-by-seat ───────────────────────────────────────────
-        moves_sw:  list = []
-        donors_sw: list = []
-        failed = False
+        if len(seats) == 4:
+            result = _resolve_4seat(
+                occupied_local, infeasible_set, oid_str, settore, fila, sp,
+                left_side, right_side, all_cap, event_date, candidate_rows,
+            )
+        else:
+            result = _resolve_3seat(
+                occupied_local, infeasible_set, oid_str, settore, fila, sp,
+                seats, left_side, right_side, all_cap, event_date, candidate_rows,
+            )
 
-        for seat in to_move:
-            placed = False
-            for target_row in candidate_rows:
-                for target_pos in sorted(keep_side):
-                    key = (settore, target_row, target_pos)
-
-                    if key not in occupied_local:
-                        # Case a: free slot
-                        moves_sw.append(_cross_move(
-                            event_date, oid_str, settore, fila, target_row, sp, seat, target_pos,
-                        ))
-                        occupied_local[key] = (oid_str, sp)
-                        placed = True
-                        break
-
-                    else:
-                        donor_oid = str(occupied_local[key][0])
-                        donor_sp  = occupied_local[key][1]
-                        if donor_oid == oid_str or donor_oid in infeasible_set:
-                            continue
-
-                        donor_seats_in_row = {
-                            p for p in all_cap
-                            if str(occupied_local.get(
-                                (settore, target_row, p), (None,)
-                            )[0]) == donor_oid
-                        }
-
-                        # Case b: donor relocates within same row
-                        for alt_pos in sorted(all_cap):
-                            if (settore, target_row, alt_pos) in occupied_local:
-                                continue
-                            new_donor = (donor_seats_in_row - {target_pos}) | {alt_pos}
-                            if is_adjacent(sorted(new_donor)):
-                                donors_sw.append(_inrow_move(
-                                    event_date, donor_oid, settore, target_row,
-                                    donor_sp, target_pos, alt_pos,
-                                ))
-                                del occupied_local[(settore, target_row, target_pos)]
-                                occupied_local[(settore, target_row, alt_pos)] = (donor_oid, donor_sp)
-                                moves_sw.append(_cross_move(
-                                    event_date, oid_str, settore, fila, target_row,
-                                    sp, seat, target_pos,
-                                ))
-                                occupied_local[(settore, target_row, target_pos)] = (oid_str, sp)
-                                placed = True
-                                break
-                        if placed:
-                            break
-
-                        # Case c: single-seat donor takes the vacated problem seat
-                        if len(donor_seats_in_row) == 1:
-                            donors_sw.append(_cross_move(
-                                event_date, donor_oid, settore, target_row, fila,
-                                donor_sp, target_pos, seat,
-                            ))
-                            del occupied_local[(settore, target_row, target_pos)]
-                            del occupied_local[(settore, fila, seat)]
-                            occupied_local[(settore, target_row, target_pos)] = (oid_str, sp)
-                            occupied_local[(settore, fila, seat)] = (donor_oid, donor_sp)
-                            moves_sw.append(_cross_move(
-                                event_date, oid_str, settore, fila, target_row,
-                                sp, seat, target_pos,
-                            ))
-                            placed = True
-                            break
-
-                if placed:
-                    break
-            if not placed:
-                failed = True
-                break
-
-        if failed:
+        if result is None:
             occupied_local.clear()
             occupied_local.update(snapshot)
-
-        # ── Attempt 2: bilateral group swap (equal-sized sides only) ─────────
-        if failed and len(to_move) == len(keep_side):
-            moves_bi:  list = []
-            donors_bi: list = []
-            failed = True
-
-            to_move_sorted = sorted(to_move)
-            keep_sorted    = sorted(keep_side)
-
-            for target_row in candidate_rows:
-                donor_info = _bilateral_donor(
-                    occupied_local, settore, target_row, keep_side, all_cap, infeasible_set,
-                )
-                if donor_info is None:
-                    continue
-                donor_oid, donor_sp = donor_info
-
-                # Problem order: minority seats → majority positions in target_row
-                for orig, dest in zip(to_move_sorted, keep_sorted):
-                    moves_bi.append(_cross_move(
-                        event_date, oid_str, settore, fila, target_row, sp, orig, dest,
-                    ))
-                # Donor: majority positions in target_row → freed minority positions in fila
-                for orig, dest in zip(keep_sorted, to_move_sorted):
-                    donors_bi.append(_cross_move(
-                        event_date, donor_oid, settore, target_row, fila, donor_sp, orig, dest,
-                    ))
-
-                # Atomic occupied_local update
-                for pos in to_move_sorted:
-                    del occupied_local[(settore, fila, pos)]
-                for pos in keep_sorted:
-                    del occupied_local[(settore, target_row, pos)]
-                for dest in keep_sorted:
-                    occupied_local[(settore, target_row, dest)] = (oid_str, sp)
-                for dest in to_move_sorted:
-                    occupied_local[(settore, fila, dest)] = (donor_oid, donor_sp)
-
-                failed = False
-                break
-
-            if failed:
-                occupied_local.clear()
-                occupied_local.update(snapshot)
-            else:
-                moves_sw, donors_sw = moves_bi, donors_bi
-
-        # ── Attempt 3: cross-side swap ────────────────────────────────────────
-        # Move each majority seat to the minority side using single-seat donors
-        # on that side (same row first, then ±1). Each donor swaps back into
-        # the vacated majority position.
-        if failed:
-            moves_cs:  list = []
-            donors_cs: list = []
-            majority_seats = sorted(seats & keep_side)
-            target_side    = right_side if keep_side == left_side else left_side
-            cs_rows = [fila] + candidate_rows   # same row first, then ±1
-
-            for s in majority_seats:
-                placed = False
-                for target_row in cs_rows:
-                    for target_pos in sorted(target_side):
-                        key = (settore, target_row, target_pos)
-
-                        if key not in occupied_local:
-                            if target_row == fila:
-                                moves_cs.append(_inrow_move(
-                                    event_date, oid_str, settore, fila, sp, s, target_pos,
-                                ))
-                            else:
-                                moves_cs.append(_cross_move(
-                                    event_date, oid_str, settore, fila, target_row,
-                                    sp, s, target_pos,
-                                ))
-                            del occupied_local[(settore, fila, s)]
-                            occupied_local[key] = (oid_str, sp)
-                            placed = True
-                            break
-
-                        else:
-                            donor_oid = str(occupied_local[key][0])
-                            donor_sp  = occupied_local[key][1]
-                            if donor_oid == oid_str or donor_oid in infeasible_set:
-                                continue
-
-                            # Donor must hold exactly one capofila seat in this settore
-                            donor_cap_count = sum(
-                                1 for k in occupied_local
-                                if k[0] == settore
-                                and str(occupied_local[k][0]) == donor_oid
-                            )
-                            if donor_cap_count != 1:
-                                continue
-
-                            if target_row == fila:
-                                moves_cs.append(_inrow_move(
-                                    event_date, oid_str, settore, fila, sp, s, target_pos,
-                                ))
-                                donors_cs.append(_inrow_move(
-                                    event_date, donor_oid, settore, fila, donor_sp,
-                                    target_pos, s,
-                                ))
-                            else:
-                                moves_cs.append(_cross_move(
-                                    event_date, oid_str, settore, fila, target_row,
-                                    sp, s, target_pos,
-                                ))
-                                donors_cs.append(_cross_move(
-                                    event_date, donor_oid, settore, target_row, fila,
-                                    donor_sp, target_pos, s,
-                                ))
-
-                            del occupied_local[(settore, fila, s)]
-                            del occupied_local[key]
-                            occupied_local[key] = (oid_str, sp)
-                            occupied_local[(settore, fila, s)] = (donor_oid, donor_sp)
-                            placed = True
-                            break
-
-                    if placed:
-                        break
-                if not placed:
-                    break
-            else:
-                failed = False
-
-            if failed:
-                occupied_local.clear()
-                occupied_local.update(snapshot)
-            else:
-                moves_sw  = moves_cs
-                donors_sw = donors_cs
-
-        if failed:
             still_infeasible.append(oid)
             continue
 
-        # COINVOLTO for seats that stayed in place (not covered by a SPOSTATO for this order)
+        order_moves, donor_moves = result
+
+        # COINVOLTO for seats that stayed at their original position
         moved_orig = {
-            m['Posto originale'] for m in moves_sw
+            m['Posto originale'] for m in order_moves
             if m['Stato'] == 'SPOSTATO' and m['Codice ordine'] == oid_str
         }
         for s in seats - moved_orig:
-            moves_sw.append({
+            order_moves.append({
                 'Data evento':     event_date,
                 'Codice ordine':   oid_str,
                 'Settore':         settore,
@@ -380,8 +442,8 @@ def fix_capofila_orders(
                 'Stato':           'COINVOLTO',
             })
 
-        capofila_moves.extend(donors_sw)
-        capofila_moves.extend(moves_sw)
+        capofila_moves.extend(donor_moves)
+        capofila_moves.extend(order_moves)
 
     return capofila_moves, still_infeasible
 

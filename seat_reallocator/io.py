@@ -39,6 +39,8 @@ def load_tickets(path: str) -> pd.DataFrame:
     df = df[df['Fila'].astype(str).str.upper() != 'GA']
     df = df[df['Stato posto'].isin(VALID)].copy()
     df['Posto'] = pd.to_numeric(df['Posto'], errors='coerce')
-    df = df.dropna(subset=['Posto', 'Data evento', 'Settore', 'Fila', 'Settore prezzi'])
+    df['Fila']  = pd.to_numeric(df['Fila'],  errors='coerce')
+    df = df.dropna(subset=['Posto', 'Fila', 'Data evento', 'Settore', 'Settore prezzi'])
     df['Posto'] = df['Posto'].astype(int)
+    df['Fila']  = df['Fila'].astype(int)
     return df

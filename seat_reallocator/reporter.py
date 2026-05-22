@@ -85,19 +85,23 @@ def write_full_report(
     occupied_mask = big_df['Stato posto'].isin(OCCUPIED)
     has_move      = big_df['_stato'].notna()
 
-    big_df['Nuovo posto'] = big_df['_posto_num']
-    big_df['Stato']       = 'NON COINVOLTO'
-    if has_cross_row:
+    if 'Nuovo posto' not in big_df.columns:
+        big_df['Nuovo posto'] = big_df['_posto_num']
+    if 'Stato' not in big_df.columns:
+        big_df['Stato'] = 'NON COINVOLTO'
+    if has_cross_row and 'Nuova fila' not in big_df.columns:
         big_df['Nuova fila'] = big_df['Fila']
 
     inf_mask = occupied_mask & big_df['_is_inf']
     big_df.loc[inf_mask, 'Stato'] = 'NON RISOLVIBILE'
 
-    big_df.loc[has_move, 'Nuovo posto'] = big_df.loc[has_move, '_nuovo_posto']
-    big_df.loc[has_move, 'Stato']       = big_df.loc[has_move, '_stato']
-    if has_cross_row and '_fila_nuova' in big_df.columns:
-        cross_mask = has_move & big_df['_fila_nuova'].notna()
-        big_df.loc[cross_mask, 'Nuova fila'] = big_df.loc[cross_mask, '_fila_nuova']
+    if has_move.any():
+        big_df.loc[has_move, 'Nuovo posto'] = big_df.loc[has_move, '_nuovo_posto']
+        big_df.loc[has_move, 'Stato']       = big_df.loc[has_move, '_stato']
+        if has_cross_row and '_fila_nuova' in big_df.columns:
+            cross_mask = has_move & big_df['_fila_nuova'].notna()
+            if cross_mask.any():
+                big_df.loc[cross_mask, 'Nuova fila'] = big_df.loc[cross_mask, '_fila_nuova']
 
     # CANCELLED / non-occupied rows are always NON COINVOLTO
     big_df.loc[~occupied_mask, 'Stato']       = 'NON COINVOLTO'
