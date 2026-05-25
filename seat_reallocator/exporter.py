@@ -65,6 +65,7 @@ def process_sheet(df: pd.DataFrame) -> dict:
         return {}
 
     relevant = df[df['Codice ordine'].isin(moved_orders)]
+    relevant = relevant[~relevant['Stato posto'].str.strip().str.upper().isin({'CANCELLED'})]
     rows = [pivot_order(grp) for _, grp in relevant.groupby('Codice ordine', sort=False)]
 
     buckets: dict = {}
