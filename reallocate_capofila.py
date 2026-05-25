@@ -4,8 +4,7 @@ import time
 
 from seat_reallocator.io import load_tickets
 from seat_reallocator.engine import detect_non_consecutive_orders
-from seat_reallocator.seats import resolve_seats
-from seat_reallocator.capofila import fix_capofila_orders
+from seat_reallocator.capofila import build_occupied_current, fix_capofila_orders
 from seat_reallocator.reporter import write_full_report
 
 _DEFAULT_OUT = 'data/report_capofila.xlsx'
@@ -48,7 +47,7 @@ def main():
         print(f'\nEvent {event_date}: {len(capofila_orders)} Capofila orders', flush=True)
         t0 = time.time()
 
-        occupied, _ = resolve_seats(event_df)
+        occupied = build_occupied_current(event_df)
         moves, still_infeasible = fix_capofila_orders(
             event_df, capofila_orders, occupied, event_date,
         )

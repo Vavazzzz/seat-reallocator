@@ -5,6 +5,32 @@ from .config import OCCUPIED
 _CAPOFILA_PATTERN = 'capofila'
 
 
+def build_occupied_current(event_df: pd.DataFrame) -> dict:
+    """
+    Build an occupied dict keyed on the CURRENT seat position (Nuovo posto when
+    present, Posto otherwise), so the chain shift operates on the actual venue
+    layout after any previous reallocation pass.
+
+    Value: (order_id, settore_prezzi, original_posto)
+    The original_posto is used as 'Posto originale' in move records so that the
+    reporter can match back to the source file row.
+    """
+    active = event_df[event_df['Stato posto'].isin(OCCUPIED)].copy()
+
+    if 'Nuovo posto' in active.columns:
+        cur = pd.to_numeric(active['Nuovo posto'], errors='coerce')
+        active['_cur'] = cur.fillna(active['Posto']).astype(int)
+    else:
+        active['_cur'] = active['Posto'].astype(int)
+
+    active_dedup = active.drop_duplicates(subset=['Settore', 'Fila', '_cur'])
+    return {
+        (r['Settore'], r['Fila'], int(r['_cur'])):
+            (str(r['Codice ordine']), r['Settore prezzi'], int(r['Posto']))
+        for r in active_dedup.to_dict('records')
+    }
+
+
 def _detect_sides(event_df: pd.DataFrame) -> dict:
     """
     Per (Settore, Settore prezzi) detect aisle seat positions from data.
@@ -31,18 +57,13 @@ def _resolve_3seat(
     seats, left_side, right_side, all_cap, event_date,
 ):
     """
-    3-seat aisle order: move the isolated aisle seat next to the pair via in-row chain shift.
-
-    The isolated seat (minority side) is relocated to the position immediately adjacent
-    to the pair. Any occupant at the target position cascades one step along the row,
-    propagating until a free slot absorbs the displacement. If the entire middle section
-    is occupied, the isolated seat's own vacated position serves as the cascade sink.
+    3-seat aisle order: move the isolated aisle seat next to the pair via in-row
+    chain shift. Operates on current positions (Nuovo posto after previous passes).
 
     Left-pair {L1,L2,Rx}: move Rx → L2+1, shifting chain rightward.
     Right-pair {Lx,R1,R2}: move Lx → R1-1, shifting chain leftward.
 
-    Price-category constraints are ignored for chain members (regular middle-row orders).
-
+    occupied_local values are (order_id, sp, original_posto) 3-tuples.
     Returns (order_moves, chain_moves) or None if infeasible.
     """
     sorted_cap = sorted(all_cap)
@@ -67,11 +88,10 @@ def _resolve_3seat(
         T         = R1 - 1
         direction = -1
 
-    # Remove the isolated seat first so its vacated position can absorb the cascade
-    # if no free seat exists in the middle section.
+    # Remove isolated seat first — its vacated position absorbs the cascade when
+    # no free slot exists in the middle section.
     del occupied_local[(settore, fila, isolated_pos)]
 
-    # Extended search includes iso_pos (now free) as the last-resort sink.
     if direction == +1:
         search_range = range(T, isolated_pos + 1)
     else:
@@ -85,7 +105,8 @@ def _resolve_3seat(
         return None
 
     if F == T:
-        occupied_local[(settore, fila, T)] = (oid_str, sp)
+        # Target already free — direct move
+        occupied_local[(settore, fila, T)] = (oid_str, sp, isolated_pos)
         return [_inrow_move(event_date, oid_str, settore, fila, sp, isolated_pos, T)], []
 
     chain_moves = _execute_shift_chain(
@@ -94,7 +115,7 @@ def _resolve_3seat(
     if chain_moves is None:
         return None
 
-    occupied_local[(settore, fila, T)] = (oid_str, sp)
+    occupied_local[(settore, fila, T)] = (oid_str, sp, isolated_pos)
     return [_inrow_move(event_date, oid_str, settore, fila, sp, isolated_pos, T)], chain_moves
 
 
@@ -103,24 +124,25 @@ def _execute_shift_chain(
 ):
     """
     Shift every occupied group in the chain between T and F by one position toward F,
-    leaving T free.
+    leaving T free. Operates in current-position (Nuovo posto) space.
 
     direction=+1: chain [T, F-1] shifts right — process F-1 down to T.
     direction=-1: chain [F+1, T] shifts left  — process F+1 up to T.
 
-    A group is all seats in this row owned by the same order. Infeasible when a chain
-    order also holds row-seats outside the chain (shifting would break its contiguity).
+    occupied_local values are (order_id, sp, original_posto) 3-tuples.
+    Move records use original_posto as Posto originale.
 
+    Infeasible when a chain order also holds row-seats outside the chain range.
     Returns list of move dicts, or None.
     """
     chain_positions = (set(range(T, F)) if direction == +1
                        else set(range(F + 1, T + 1)))
 
-    # Build per-order index of all positions held in this row
+    # Build per-order index of all current positions held in this row
     row_index: dict = {}
-    for (s, f, p), (o, _) in occupied_local.items():
+    for (s, f, p), entry in occupied_local.items():
         if s == settore and f == fila:
-            row_index.setdefault(str(o), set()).add(p)
+            row_index.setdefault(str(entry[0]), set()).add(p)
 
     # Collect chain orders
     chain_orders: dict = {}
@@ -131,12 +153,12 @@ def _execute_shift_chain(
         oid_d = str(entry[0])
         chain_orders.setdefault(oid_d, []).append(p)
 
-    # Validate: no chain order has row-seats outside the chain (would create a gap)
+    # Validate: no chain order has row-seats outside the chain (would break contiguity)
     for oid_d in chain_orders:
         if not row_index.get(oid_d, set()).issubset(chain_positions):
             return None
 
-    # Execute from F-end toward T so each position is vacated before its neighbour moves in
+    # Execute from F-end toward T
     moves: list = []
     processed: set = set()
     scan = (range(F - 1, T - 1, -1) if direction == +1 else range(F + 1, T + 1))
@@ -145,7 +167,7 @@ def _execute_shift_chain(
         entry = occupied_local.get((settore, fila, p))
         if entry is None:
             continue
-        oid_d, sp_d = entry
+        oid_d = entry[0]
         if oid_d in processed:
             continue
         processed.add(oid_d)
@@ -153,10 +175,11 @@ def _execute_shift_chain(
         positions = sorted(chain_orders[oid_d])
         shift_seq = reversed(positions) if direction == +1 else iter(positions)
         for pos in shift_seq:
+            _, sp_pos, orig_pos = occupied_local[(settore, fila, pos)]
             new_pos = pos + direction
             del occupied_local[(settore, fila, pos)]
-            occupied_local[(settore, fila, new_pos)] = (oid_d, sp_d)
-            moves.append(_inrow_move(event_date, oid_d, settore, fila, sp_d, pos, new_pos))
+            occupied_local[(settore, fila, new_pos)] = (oid_d, sp_pos, orig_pos)
+            moves.append(_inrow_move(event_date, oid_d, settore, fila, sp_pos, orig_pos, new_pos))
 
     return moves
 
@@ -168,11 +191,13 @@ def fix_capofila_orders(
     event_date: str,
 ) -> tuple:
     """
-    Post-process NON RISOLVIBILE Capofila orders.
+    Post-process NON RISOLVIBILE Capofila orders via in-row chain shift.
 
-    3-seat orders ({L1,L2,Rx} or {Lx,R1,R2}): move isolated seat next to pair
-        via in-row chain shift (minimises total disruption, no cross-row moves).
-    4-seat orders: left unchanged (not handled here).
+    occupied must be built with build_occupied_current() so that keys reflect
+    the actual current seat positions (Nuovo posto after any prior reallocation).
+
+    3-seat orders ({L1,L2,Rx} or {Lx,R1,R2}): move isolated seat next to pair.
+    4-seat orders: left unchanged.
 
     Returns:
         capofila_moves:   list of move dicts
@@ -210,11 +235,12 @@ def fix_capofila_orders(
 
         left_side, right_side, all_cap = sides_cache[sides_key]
 
+        # Capofila orders were NON RISOLVIBILE in the prior pass, so their
+        # current position equals their original Posto. Use Posto for the lookup.
         if not all((settore, fila, s) in occupied_local for s in seats):
             still_infeasible.append(oid)
             continue
 
-        # 4-seat orders are left unchanged
         if len(seats) == 4:
             still_infeasible.append(oid)
             continue
