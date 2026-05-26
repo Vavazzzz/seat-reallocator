@@ -57,13 +57,26 @@ def _resolve_3seat(
     seats, left_side, right_side, all_cap, event_date,
 ):
     """
-    3-seat aisle order: move the isolated aisle seat next to the pair via in-row
-    chain shift. Operates on current positions (Nuovo posto after previous passes).
+    3-seat aisle order: move the isolated seat adjacent to the pair via in-row shift.
 
-    Left-pair {L1,L2,Rx}: move Rx → L2+1, shifting chain rightward.
-    Right-pair {Lx,R1,R2}: move Lx → R1-1, shifting chain leftward.
+    Three strategies are assembled and tried in ascending order of estimated moves;
+    the first one that passes chain-validation wins:
 
-    occupied_local values are (order_id, sp, original_posto) 3-tuples.
+    1. Relay — a single-seat order X jumps to the vacated isolated position; only
+       the seats between T and X need to shift (often far fewer than the full gap).
+       Cost = |X - T| + 1.  X is scanned nearest-first so the cheapest relay is
+       found quickly; scanning stops once relay cost would exceed standard cost.
+
+    2. Standard cascade — shift [T, F-1] toward F (nearest free slot from T toward
+       isolated_pos, guaranteed to exist because isolated_pos itself is free).
+       Cost = |F - T|.
+
+    3. Secondary cascade — shift the pair outward (away from isolated seat), freeing
+       the pair's inner aisle seat for the isolated seat to fill.  Valid only when
+       the two pair seats are consecutive (L2 = L1+1 or R1 = R2-1).
+       Cost = distance to the nearest free slot on the outer side.
+
+    occupied_local values: (order_id, settore_prezzi, original_posto)
     Returns (order_moves, chain_moves) or None if infeasible.
     """
     sorted_cap = sorted(all_cap)
@@ -78,45 +91,104 @@ def _resolve_3seat(
     if len(left_seats) >= len(right_seats):
         if len(right_seats) != 1:
             return None
-        isolated_pos = next(iter(right_seats))
-        T         = L2 + 1
-        direction = +1
+        isolated_pos   = next(iter(right_seats))
+        T_pri, dir_pri = L2 + 1, +1
+        T_sec, dir_sec = sorted_cap[1], -1     # free L2 by leftward cascade
+        pair_consec    = (sorted_cap[1] == sorted_cap[0] + 1)
     else:
         if len(left_seats) != 1:
             return None
-        isolated_pos = next(iter(left_seats))
-        T         = R1 - 1
-        direction = -1
+        isolated_pos   = next(iter(left_seats))
+        T_pri, dir_pri = R1 - 1, -1
+        T_sec, dir_sec = sorted_cap[2], +1     # free R1 by rightward cascade
+        pair_consec    = (sorted_cap[3] == sorted_cap[2] + 1)
 
-    # Remove isolated seat first — its vacated position absorbs the cascade when
-    # no free slot exists in the middle section.
+    # Remove isolated seat — its vacated position is available as a relay landing spot.
     del occupied_local[(settore, fila, isolated_pos)]
 
-    if direction == +1:
-        search_range = range(T, isolated_pos + 1)
-    else:
-        search_range = range(T, isolated_pos - 1, -1)
+    # Per-order seat count in this row (snapshot after isolated removal).
+    row_index: dict = {}
+    for (s, f, p), entry in occupied_local.items():
+        if s == settore and f == fila:
+            row_index.setdefault(str(entry[0]), []).append(p)
 
-    F = next(
-        (p for p in search_range if (settore, fila, p) not in occupied_local),
-        None,
-    )
-    if F is None:
-        return None
+    # --- Standard primary cascade ---
+    range_pri = (range(T_pri, isolated_pos + 1) if dir_pri == +1
+                 else range(T_pri, isolated_pos - 1, -1))
+    F_pri = next((p for p in range_pri if (settore, fila, p) not in occupied_local), None)
+    d_pri = abs(F_pri - T_pri) if F_pri is not None else float('inf')
 
-    if F == T:
-        # Target already free — direct move
-        occupied_local[(settore, fila, T)] = (oid_str, sp, isolated_pos)
-        return [_inrow_move(event_date, oid_str, settore, fila, sp, isolated_pos, T)], []
+    # candidates: (cost, T, F_or_X, direction, relay_entry_or_None)
+    candidates = []
+    if F_pri is not None:
+        candidates.append((d_pri, T_pri, F_pri, dir_pri, None))
 
-    chain_moves = _execute_shift_chain(
-        occupied_local, settore, fila, T, F, direction, event_date,
-    )
-    if chain_moves is None:
-        return None
+    # --- Relay candidates (primary direction only) ---
+    relay_scan = (range(T_pri, isolated_pos) if dir_pri == +1
+                  else range(T_pri, isolated_pos, -1))
+    for X in relay_scan:
+        entry_x = occupied_local.get((settore, fila, X))
+        if entry_x is None:
+            continue                               # free slot — standard handles it
+        if len(row_index.get(str(entry_x[0]), [])) != 1:
+            continue                               # multi-seat order, skip
+        d_relay = abs(X - T_pri) + 1
+        if d_relay > d_pri:
+            break                                  # further relays only get more expensive
+        candidates.append((d_relay, T_pri, X, dir_pri, entry_x))
 
-    occupied_local[(settore, fila, T)] = (oid_str, sp, isolated_pos)
-    return [_inrow_move(event_date, oid_str, settore, fila, sp, isolated_pos, T)], chain_moves
+    # --- Secondary cascade (pair shifts outward) ---
+    if pair_consec:
+        p = T_sec + dir_sec
+        while 1 <= p <= 9999:
+            if (settore, fila, p) not in occupied_local:
+                candidates.append((abs(p - T_sec), T_sec, p, dir_sec, None))
+                break
+            p += dir_sec
+
+    candidates.sort(key=lambda c: c[0])
+
+    for _, T, F_or_X, direction, relay_entry in candidates:
+        snapshot = dict(occupied_local)
+
+        if relay_entry is not None:
+            # Relay: jump single-seat order from X to isolated_pos, then cascade [T, X).
+            X = F_or_X
+            del occupied_local[(settore, fila, X)]
+            occupied_local[(settore, fila, isolated_pos)] = relay_entry
+            relay_move = _inrow_move(
+                event_date, relay_entry[0], settore, fila,
+                relay_entry[1], relay_entry[2], isolated_pos,
+            )
+            # X is now free — use it as the cascade sink.
+            chain_moves = _execute_shift_chain(
+                occupied_local, settore, fila, T, X, direction, event_date,
+            )
+            if chain_moves is not None:
+                occupied_local[(settore, fila, T)] = (oid_str, sp, isolated_pos)
+                return (
+                    [_inrow_move(event_date, oid_str, settore, fila, sp, isolated_pos, T)],
+                    chain_moves + [relay_move],
+                )
+        else:
+            # Standard / secondary cascade.
+            if F_or_X == T:
+                occupied_local[(settore, fila, T)] = (oid_str, sp, isolated_pos)
+                return [_inrow_move(event_date, oid_str, settore, fila, sp, isolated_pos, T)], []
+            chain_moves = _execute_shift_chain(
+                occupied_local, settore, fila, T, F_or_X, direction, event_date,
+            )
+            if chain_moves is not None:
+                occupied_local[(settore, fila, T)] = (oid_str, sp, isolated_pos)
+                return (
+                    [_inrow_move(event_date, oid_str, settore, fila, sp, isolated_pos, T)],
+                    chain_moves,
+                )
+
+        occupied_local.clear()
+        occupied_local.update(snapshot)
+
+    return None
 
 
 def _execute_shift_chain(
@@ -173,13 +245,26 @@ def _execute_shift_chain(
         processed.add(oid_d)
 
         positions = sorted(chain_orders[oid_d])
-        shift_seq = reversed(positions) if direction == +1 else iter(positions)
-        for pos in shift_seq:
-            _, sp_pos, orig_pos = occupied_local[(settore, fila, pos)]
-            new_pos = pos + direction
-            del occupied_local[(settore, fila, pos)]
-            occupied_local[(settore, fila, new_pos)] = (oid_d, sp_pos, orig_pos)
-            moves.append(_inrow_move(event_date, oid_d, settore, fila, sp_pos, orig_pos, new_pos))
+        is_consec = (len(positions) == 1 or
+                     positions[-1] - positions[0] == len(positions) - 1)
+        if is_consec:
+            # Consecutive block: only the boundary seat crosses a new threshold;
+            # all interior seats stay in place (no unnecessary moves).
+            move_from = positions[0] if direction == +1 else positions[-1]
+            move_to   = positions[-1] + 1 if direction == +1 else positions[0] - 1
+            _, sp_pos, orig_pos = occupied_local[(settore, fila, move_from)]
+            del occupied_local[(settore, fila, move_from)]
+            occupied_local[(settore, fila, move_to)] = (oid_d, sp_pos, orig_pos)
+            moves.append(_inrow_move(event_date, oid_d, settore, fila, sp_pos, orig_pos, move_to))
+        else:
+            # Non-consecutive seats (defensive fallback): shift each seat individually.
+            shift_seq = reversed(positions) if direction == +1 else iter(positions)
+            for pos in shift_seq:
+                _, sp_pos, orig_pos = occupied_local[(settore, fila, pos)]
+                new_pos = pos + direction
+                del occupied_local[(settore, fila, pos)]
+                occupied_local[(settore, fila, new_pos)] = (oid_d, sp_pos, orig_pos)
+                moves.append(_inrow_move(event_date, oid_d, settore, fila, sp_pos, orig_pos, new_pos))
 
     return moves
 
@@ -260,12 +345,17 @@ def fix_capofila_orders(
 
         order_moves, chain_moves = result
 
-        # COINVOLTO for capofila seats that stayed at their original position
+        # COINVOLTO for capofila seats that neither moved directly nor via chain
+        # (Option B cascades the pair via chain_moves, so exclude those too).
+        chain_moved_orig = {
+            m['Posto originale'] for m in chain_moves
+            if str(m['Codice ordine']) == oid_str
+        }
         moved_orig = {
             m['Posto originale'] for m in order_moves
             if m['Stato'] == 'SPOSTATO' and m['Codice ordine'] == oid_str
         }
-        for s in seats - moved_orig:
+        for s in seats - moved_orig - chain_moved_orig:
             order_moves.append({
                 'Data evento':     event_date,
                 'Codice ordine':   oid_str,
