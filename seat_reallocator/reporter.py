@@ -1,6 +1,7 @@
 import pandas as pd
 
 from .config import OCCUPIED
+from .io import load_csv
 
 _MOVE_COLS = [
     'Codice ordine', 'Settore', 'Fila', 'Settore prezzi',
@@ -39,15 +40,7 @@ def write_full_report(
         )
         big_df = pd.concat(sheets.values(), ignore_index=True)
     else:
-        with open(source_path, 'r', encoding='utf-8-sig') as f:
-            first_line = f.readline()
-        sep = ';' if ';' in first_line else ','
-        big_df = pd.read_csv(
-            source_path,
-            sep=sep,
-            low_memory=False,
-            dtype={'Codice ordine': str, 'Data evento': str},
-        )
+        big_df = load_csv(source_path, dtype={'Codice ordine': str, 'Data evento': str})
     big_df['Codice ordine'] = big_df['Codice ordine'].astype(str)
     big_df['_posto_num'] = pd.to_numeric(big_df['Posto'], errors='coerce')
 

@@ -17,32 +17,39 @@ The primary solver is an **Integer Linear Program (ILP)** that jointly optimises
 
 The key insight driving decomposition is unchanged: a seat in `(Settore B, Row 7, price PRIMO)` can only be swapped with another seat in the exact same `(Settore, Fila, Settore prezzi)` triple. Every such triple is an independent 1-D sub-problem, solved separately.
 
-### Main execution flow
+### Three-script workflow
 
 ```
-parse_orders()      → {event_date: {order_ids}}
-load_tickets()      → filtered DataFrame (auto-detects ; or , separator)
-                       ↓
+1. reallocate.py           Standard reallocation pass (ILP / backtrack solver)
+2. reallocate_capofila.py  Capofila-specific pass using chain-shift (run on output of step 1)
+3. build_post_report.py    Joins annotated output with updated ticket data for final report
+```
+
+Steps 1 and 2 both produce an annotated `.xlsx`; step 3 consumes that output together with a fresh ticket export.
+
+### Main execution flow (reallocate.py)
+
+```
+load_tickets()              → filtered DataFrame
+detect_non_consecutive_orders() → {event_date: {order_ids}}
+                              ↓
 for each event_date:
   process_event()
-    resolve_seats()     → occupied + free seat maps
-    build_segments()    → independent (settore, fila, sp) sub-problems
-    cross-segment check → immediately flag orders spanning >1 segment
+    resolve_seats()           → occupied + free seat maps
+    build_segments()          → independent (settore, fila, sp) sub-problems
+    cross-segment check       → immediately flag cross-segment orders
     for each relevant segment:
-      solve_segment()   [ILP path via ILPSolver]
-        build binary variables x[order, block]
-        add assignment constraints
-        add seat-conflict constraints
+      solve_segment()         [ILP path via ILPSolver]
+        build binary vars x[order, block]
+        add assignment + conflict constraints
         build tiered objective (INFEASIBLE_PENALTY / COLL_PENALTY / displacement)
         solve with CBC (ILP_TIME_LIMIT seconds)
         → on failure: BacktrackSolver [backtracking fallback]
         extract assignment, emit moves
-                       ↓
-detect_collateral()   → identify orders adjacent before but not after
-                       ↓
-write output:
-  default mode    → data/reallocation.xlsx   (moved + infeasible seats only)
-  --full-report   → data/report_annotated.xlsx (every row annotated)
+                              ↓
+detect_collateral()         → flag orders adjacent before but non-adjacent after
+                              ↓
+write_full_report()         → annotated xlsx (one sheet per event)
 ```
 
 ---
@@ -53,18 +60,25 @@ write output:
 seat_reallocator/
     __init__.py         package marker
     config.py           all constants and tuning parameters
-    io.py               CSV loading and orders-file parsing
+    io.py               CSV/Excel loading and orders-file parsing
     geometry.py         pure 1-D geometry helpers (no I/O, no pandas)
     seats.py            seat-state resolution and segment partitioning
-    engine.py           per-event orchestration and collateral detection
-    reporter.py         Excel output for both write modes
-    cli.py              CLI entry point (argparse + main loop)
+    engine.py           per-event orchestration, detection, collateral
+    capofila.py         chain-shift fixer for Capofila aisle orders
+    reporter.py         Excel output (write_full_report)
+    post_report.py      post-reallocation report builder (DF1 + DF2 + DF3)
+    cli.py              CLI entry point for reallocate.py
+    exporter.py         per-order swap-file exporter
     solver/
         __init__.py     public solve_segment() entry point
         base.py         SegmentSolver abstract base class
         backtrack.py    BacktrackSolver — greedy warm-start + branch-and-bound
         ilp.py          ILPSolver — primary ILP solver (delegates to BT on failure)
-reallocate.py           thin shell: `from seat_reallocator.cli import main; main()`
+
+reallocate.py           thin shell → seat_reallocator.cli.main()
+reallocate_capofila.py  thin shell → capofila workflow
+build_post_report.py    thin shell → seat_reallocator.post_report.main()
+export_swap.py          thin shell → seat_reallocator.exporter.export_swap_files()
 ```
 
 ---
@@ -90,11 +104,12 @@ All constants and tuning parameters in one place. Changing solver behaviour
 
 ### `io.py`
 
-**Public interface**: `parse_orders(path)`, `load_tickets(path)`
+**Public interface**: `load_csv(path, **kwargs)`, `parse_orders(path)`, `load_tickets(path)`
 
-Responsible for all file I/O. Auto-detects `;` vs `,` separator by peeking at
-the first line of the CSV. Uses `ast.literal_eval` to safely parse the Python
-list literal in `orders.txt`.
+Responsible for all file I/O. `load_csv` auto-detects `;` vs `,` by peeking at
+the first line; it is the shared low-level loader used by `load_tickets`,
+`reporter.py`, and `post_report.py`. `load_tickets` additionally filters out
+GA rows, non-VALID statuses, and coerces seat/row numbers to integers.
 
 No business logic — pure data ingestion.
 
@@ -129,6 +144,76 @@ by the solver.
 
 ---
 
+### `engine.py`
+
+**Public interface**: `detect_non_consecutive_orders(df)`, `process_event(event_df, problematic)`, `detect_collateral(active_df, all_moves, infeasible_set)`
+
+Orchestrates per-event and post-processing work.
+
+- `detect_non_consecutive_orders` — scans all orders in the loaded DataFrame and
+  returns `{event_date: set(order_ids)}` for orders whose seats span multiple
+  sectors, multiple rows, or non-consecutive seat numbers within a price group.
+- `process_event` — resolves seats, builds segments, flags cross-segment
+  infeasible orders, dispatches each relevant segment to `solve_segment`, and
+  assembles move dicts. Returns `(all_moves, all_infeasible)`.
+- `detect_collateral` — post-hoc pass that identifies orders that were adjacent
+  before reallocation and non-adjacent after by replaying all moves on the
+  original seat state.
+
+---
+
+### `capofila.py`
+
+**Public interface**: `build_occupied_current(event_df)`, `fix_capofila_orders(event_df, order_ids, occupied, event_date)`
+
+Handles "Capofila" aisle-seat orders — orders whose `Settore prezzi` contains
+the string `'capofila'`. These orders have a special L/R aisle structure that
+the standard ILP solver cannot fix; instead a chain-shift approach is used.
+
+- `build_occupied_current` — builds `{(settore, fila, posto): (order_id, sp, original_posto)}`
+  keyed on `Nuovo posto` when present (so chain shifts operate on post-reallocation
+  positions, not original positions).
+- `_detect_sides` — infers which seat positions are left-aisle vs right-aisle by
+  splitting the sorted distinct `Posto` values for each `(Settore, Settore prezzi)`
+  capofila group at the midpoint.
+- `fix_capofila_orders` — for each non-consecutive 3-seat capofila order, tries
+  three strategies (relay, primary cascade, secondary cascade) in ascending cost
+  order. 4-seat orders are left unchanged. Returns `(capofila_moves, still_infeasible)`.
+
+---
+
+### `reporter.py`
+
+**Public interface**: `write_full_report(source_path, all_moves, infeasible_set, collateral_rows, path=...)`
+
+All Excel output in one place.
+
+- `write_full_report` — reads the full source file again, left-merges the move
+  DataFrame on `(Data evento, Codice ordine, posto_num)`, annotates every row
+  with `Nuovo posto` and `Stato`, drops temp columns, reorders so the new columns
+  follow `Posto`, writes one sheet per event. Returns the annotated DataFrame
+  for stat reporting in the CLI.
+
+---
+
+### `post_report.py`
+
+**Public interface**: `build(annotated_path, updated_report_path, extra_path, annullo_from, out_path)`, `main()`
+
+Produces the final post-reallocation report by combining three data sources:
+
+1. **DF1** — `report_annotated.xlsx` (output of `reallocate.py` or `reallocate_capofila.py`).
+   Filtered to rows with `Stato` in `{SPOSTATO, COINVOLTO}`.
+2. **DF2** — Updated full ticket-report CSV (latest export from the ticketing system).
+   Inner-joined to DF1 on `Sigillo fiscale`; DF2 becomes the base with reallocation
+   columns (`Nuovo posto`, `Stato`, optionally `Nuova fila`) merged in from DF1.
+3. **DF3** — Supplementary data CSV. Left-joined on `(Codice ordine, Posto)` to
+   append extra columns (e.g., contact details).
+
+A `--annullo-from DATE` filter is applied to keep only rows where `data annullo > DATE`.
+
+---
+
 ### `solver/base.py`
 
 **Public interface**: `SegmentSolver` (ABC)
@@ -159,8 +244,6 @@ Greedy warm-start + branch-and-bound search.
    is called at each leaf to evaluate collateral damage for a candidate placement.
 4. **Non-prob assignment** — after prob orders are placed, displaced orders get
    priority, then intact orders reclaim their original seats where possible.
-5. **Fallback within fallback** — if backtracking finds nothing, a plain greedy
-   pass runs independently.
 
 ---
 
@@ -195,37 +278,6 @@ Single public entry point for the solver subsystem. Currently delegates to
 
 ---
 
-### `engine.py`
-
-**Public interface**: `process_event(event_df, problematic)`, `detect_collateral(active_df, all_moves, infeasible_set)`
-
-Orchestrates per-event and post-processing work.
-
-- `process_event` — resolves seats, builds segments, flags cross-segment
-  infeasible orders, dispatches each relevant segment to `solve_segment`, and
-  assembles move dicts. Returns `(all_moves, all_infeasible)`.
-- `detect_collateral` — post-hoc pass that identifies orders that were adjacent
-  before reallocation and non-adjacent after by replaying all moves on the
-  original seat state.
-
----
-
-### `reporter.py`
-
-**Public interface**: `write_reallocation_report(all_rows, collateral_rows, path=...)`,
-`write_full_report(source_path, all_moves, infeasible_set, collateral_rows, path=...)`
-
-All Excel I/O in one place.
-
-- `write_reallocation_report` — summary mode: one sheet per event with only
-  moved/infeasible seats, plus optional `COLLATERALE` sheet.
-- `write_full_report` — annotated mode: reads the full source CSV again, joins
-  moves on `(Data evento, Codice ordine, posto_num)`, annotates every row with
-  `Nuovo posto` and `Stato`, writes one sheet per event. Returns the annotated
-  DataFrame for stat reporting in the CLI.
-
----
-
 ### `cli.py`
 
 **Public interface**: `main()`
@@ -235,12 +287,21 @@ between engine and reporter. No business logic — pure orchestration.
 
 ---
 
+### `exporter.py`
+
+**Public interface**: `export_swap_files(input_path, output_dir)`
+
+Reads an annotated `.xlsx`, filters to `SPOSTATO` rows, and writes one CSV per
+order containing the seat-swap mapping. Skips the `COLLATERALE` sheet.
+
+---
+
 ## 4. Dependency graph
 
 ```
 cli.py
   ├── io.py              (load_tickets, parse_orders)
-  ├── engine.py          (process_event, detect_collateral)
+  ├── engine.py          (detect_non_consecutive_orders, process_event, detect_collateral)
   │     ├── geometry.py  (is_adjacent)
   │     ├── seats.py     (resolve_seats, build_segments)
   │     │     └── config.py
@@ -252,17 +313,36 @@ cli.py
   │           └── backtrack.py
   │                 ├── geometry.py
   │                 └── config.py
-  └── reporter.py        (write_reallocation_report, write_full_report)
+  └── reporter.py        (write_full_report)
+        ├── io.py        (load_csv)
         └── config.py    (OCCUPIED)
+
+reallocate_capofila.py
+  ├── io.py              (load_tickets)
+  ├── engine.py          (detect_non_consecutive_orders)
+  ├── capofila.py        (build_occupied_current, fix_capofila_orders)
+  │     └── config.py   (OCCUPIED)
+  └── reporter.py        (write_full_report)
+
+post_report.py
+  └── io.py              (load_csv)
 ```
 
-External dependencies: `pandas` (data loading/grouping), `pulp` (ILP solver —
-optional, graceful fallback if absent), `openpyxl` (Excel output). `ast`,
-`time`, `collections`, `argparse` from the standard library.
+External dependencies: `pandas`, `openpyxl`, `pulp` (optional — graceful fallback), `numpy`.
 
 ---
 
 ## 5. Function-by-function reference
+
+### `load_csv(path, **kwargs)` — `io.py`
+
+**Output**: `pd.DataFrame`
+
+Peeks at the first line to detect `;` vs `,`. Passes `**kwargs` directly to
+`pd.read_csv`. Used by `load_tickets`, `reporter.write_full_report`, and
+`post_report.build`.
+
+---
 
 ### `parse_orders(path)` — `io.py`
 
@@ -276,10 +356,20 @@ Each line in `orders.txt` has the format
 
 ### `load_tickets(path)` — `io.py`
 
-**Output**: cleaned `pd.DataFrame` with `Posto` as `int`.
+**Output**: cleaned `pd.DataFrame` with `Posto` and `Fila` as `int`.
 
-Peeks at the first line to detect `;` vs `,`. Filters to `VALID` statuses,
-coerces `Posto` to numeric, drops rows with missing key columns.
+Accepts both CSV and Excel (multi-sheet). Filters out GA rows, non-VALID
+statuses, and rows with missing key columns. Uses `load_csv` for the CSV path.
+
+---
+
+### `detect_non_consecutive_orders(df)` — `engine.py`
+
+**Output**: `dict[str, set[str]]` — `{event_date: set(order_ids)}`
+
+An order is problematic if, within any `Settore prezzi` group, its seats span
+multiple `Settore`, multiple `Fila`, or non-consecutive `Posto` values. Respects
+the optional `Selezione in mappa` column (rows with value `'true'` are excluded).
 
 ---
 
@@ -301,55 +391,30 @@ Including `settore_prezzi` in the key structurally forbids cross-price swaps.
 
 ---
 
-### `contiguous_runs(positions)` — `geometry.py`
+### `build_occupied_current(event_df)` — `capofila.py`
 
-**Example**: `[1, 2, 3, 5, 6, 10]` → `[[1, 2, 3], [5, 6], [10]]`
+**Output**: `{(settore, fila, posto): (order_id, sp, original_posto)}`
 
-Linear scan — extend current run if next position = `prev + 1`, otherwise open
-a new run. Used by both solvers to enumerate candidate blocks.
-
----
-
-### `is_adjacent(postos)` — `geometry.py`
-
-Sort, then verify every adjacent pair differs by exactly 1.
+Keyed on `Nuovo posto` when present, so chain shifts operate on the actual
+current layout after any prior reallocation pass. The `original_posto` value is
+retained as `Posto originale` in move records so the reporter can match rows.
 
 ---
 
-### `pair_seats(old_p, new_p)` — `geometry.py`
+### `fix_capofila_orders(event_df, order_ids, occupied, event_date)` — `capofila.py`
 
-Keeps seats present in both lists fixed (no move emitted), then zips remaining
-positions in sorted order. Reduces noise in the output vs. naive `zip`.
+**Output**: `(capofila_moves: list, still_infeasible: list)`
 
----
+For each 3-seat capofila order in `order_ids`, three strategies are tried in
+ascending estimated cost:
+1. **Relay** — a single-seat neighbouring order jumps to the vacated position;
+   the shorter gap is cascaded.
+2. **Primary cascade** — shift the block between the isolated seat and the pair
+   toward the nearest free slot.
+3. **Secondary cascade** — shift the pair outward, freeing its inner aisle seat
+   for the isolated seat to fill.
 
-### `ILPSolver.solve(seats, free_postos, problematic_set)` — `solver/ilp.py`
-
-See section 3 for the full model description. Key steps:
-
-1. Build `candidates` — all contiguous k-blocks for every order, plus a dummy
-   "original" block for prob orders (the infeasibility escape hatch).
-2. Create binary variables `x[oid, block]`.
-3. Add assignment and conflict constraints.
-4. Build three-tier objective.
-5. Solve with `PULP_CBC_CMD(msg=0, timeLimit=ILP_TIME_LIMIT)`.
-6. If `sol_status not in (1, 2)` → delegate to `BacktrackSolver`.
-7. Extract assignment, identify infeasible orders (those assigned their dummy),
-   invert to seat → order, emit moves via `pair_seats`.
-
----
-
-### `BacktrackSolver.solve(seats, free_postos, problematic_set)` — `solver/backtrack.py`
-
-1. Greedy warm-start seeds `best` with an initial `(collateral, displacement)`.
-2. `backtrack(idx, taken, placement, partial_cost)` — recursive DFS. Prunes on
-   displacement only once a zero-collateral solution exists.
-3. `simulate_collateral(placement)` — called at every leaf; simulates the full
-   non-prob greedy reassignment and counts formerly-adjacent orders that become
-   non-adjacent.
-4. `record_if_better` — lexicographic update of `best`.
-5. After search: prob orders placed, infeasible locked in place, non-prob orders
-   assigned from the remaining pool (displaced first, then intact).
+4-seat orders are left unchanged (added to `still_infeasible`).
 
 ---
 
@@ -367,24 +432,22 @@ See section 3 for the full model description. Key steps:
 
 Replays all moves on the original seat state to reconstruct the final seat
 assignment, then flags any order that was adjacent before but non-adjacent after.
-Detection condition: `not is_adjacent(orig_ps) or is_adjacent(final[oid])` —
-skip if originally non-adjacent (not collateral) or still adjacent (no damage).
 
 ---
 
-### `write_reallocation_report(...)` — `reporter.py`
+### `write_full_report(source_path, all_moves, infeasible_set, collateral_rows, path)` — `reporter.py`
 
-Groups `all_rows` by `'Data evento'`, writes each group (minus `'Data evento'`
-column) as one sheet. Appends `COLLATERALE` sheet if any.
-
----
-
-### `write_full_report(...)` — `reporter.py`
-
-Re-reads the source CSV, left-merges the move DataFrame on
+Re-reads the source file, left-merges the move DataFrame on
 `(Data evento, Codice ordine, posto_num)`, annotates each row with `Nuovo posto`
-and `Stato`, drops temp columns, reorders so the two new columns follow `Posto`,
+and `Stato`, drops temp columns, reorders so the new columns follow `Posto`,
 writes one sheet per event. Returns the annotated DataFrame.
+
+---
+
+### `build(annotated_path, updated_report_path, extra_path, annullo_from, out_path)` — `post_report.py`
+
+Three-way merge producing the final report. See section 3 (`post_report.py`) for
+the full merge logic.
 
 ---
 
@@ -405,6 +468,7 @@ report writing. Pure orchestration; no domain logic.
 | Add a validation pass | Insert a new function in `engine.py` between `resolve_seats` and `build_segments` |
 | Extend reporting | Add a new function in `reporter.py` |
 | Change output paths | Update defaults in `reporter.py` or pass `path=` from `cli.py` |
+| Add a new post-processing step | Add a function in `post_report.py` or a new module |
 
 ---
 
@@ -422,14 +486,15 @@ report writing. Pure orchestration; no domain logic.
 
 ## 8. Input/output formats
 
-### `data/report_cleaned.csv`
+### `data/report.csv`
 
 ```
 Codice ordine,Stato ordine,Stato posto,Data evento,Item,Settore,Fila,Posto,Settore prezzi
 3406628,REGULAR,CONFIRMED,2026-06-27 21:00:00.0,...,Prato Gold,GA,3,PRATO GOLD
 ```
 
-Separator auto-detected (`;` or `,`).
+Separator auto-detected (`;` or `,`). Rows where `Fila == "GA"` or
+`Stato posto ∉ {CONFIRMED, RESALE, CANCELLED}` are filtered out.
 
 ### `data/orders.txt`
 
@@ -440,13 +505,15 @@ Separator auto-detected (`;` or `,`).
 
 One line per event. Python list literal after the colon.
 
-### `data/reallocation.xlsx` (default mode)
+### `data/report_annotated.xlsx` (output of reallocate.py / reallocate_capofila.py)
 
-One sheet per event. Columns: `Codice ordine, Settore, Fila, Settore prezzi, Posto originale, Posto nuovo, Stato`. Optional `COLLATERALE` sheet.
+One sheet per event containing every row of the source file, with added columns
+`Nuovo posto` and `Stato` inserted after `Posto`. Optional `COLLATERALE` sheet.
 
-### `data/report_annotated.xlsx` (`--full-report` mode)
+### `data/post_report.xlsx` (output of build_post_report.py)
 
-One sheet per event containing every row of the source file, with two added columns (`Nuovo posto`, `Stato`) inserted after `Posto`. Optional `COLLATERALE` sheet.
+Single-sheet Excel file: DF2 rows matched to DF1 on `Sigillo fiscale`, enriched
+with `Nuovo posto` / `Stato`, filtered by `data annullo`, and joined to DF3.
 
 ---
 
@@ -458,3 +525,4 @@ One sheet per event containing every row of the source file, with two added colu
 4. **Non-adjacent non-prob orders use centroid distance**, not exact displacement, in the ILP objective.
 5. **Sheet name collision** — if two event dates produce the same 31-character truncated string, `openpyxl` will error.
 6. **Full-report merge assumes unique `(event, order, seat)` rows** — duplicates in the source CSV will inflate counts.
+7. **Capofila 4-seat orders** are always left as `NON RISOLVIBILE` — the chain-shift strategy is only defined for 3-seat orders.

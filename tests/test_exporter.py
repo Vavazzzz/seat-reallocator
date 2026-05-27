@@ -10,6 +10,7 @@ from seat_reallocator.exporter import pivot_order, process_sheet
 def _row(**kwargs) -> dict:
     defaults = {
         'Codice ordine': 'O1', 'Posto': '5', 'Stato': 'NON COINVOLTO',
+        'Stato posto': 'CONFIRMED',
         'Nuovo posto': '5', 'Item': 'SectorA', 'Settore': 'A', 'Fila': '1',
         'Codice supporto': 'BC01', 'Cognome partecipante': '', 'Nome partecipante': '',
         'Cognome': 'Rossi', 'Nome': 'Mario', 'Email': 'm@example.com',

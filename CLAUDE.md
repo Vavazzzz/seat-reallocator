@@ -2,39 +2,60 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Running the tool
+## Running the workflow
 
 ```bash
-# Activate the virtual environment (Python 3.14, dependencies: pandas, openpyxl, numpy)
+# Activate the virtual environment (Python 3.14)
 .venv\Scripts\activate
 
-# Run the seat reallocator (auto-detects non-consecutive orders)
+# Step 1: Standard reallocation pass
 python reallocate.py data/report.csv
-
-# Override auto-detection with a manual orders file
+# With manual orders override:
 python reallocate.py data/report.csv --orders data/orders.txt
-
-# Override output path (default: data/report_annotated.xlsx)
+# Custom output path (default: data/report_annotated.xlsx):
 python reallocate.py data/report.csv --out data/my_output.xlsx
+
+# Step 2: Capofila aisle-seat pass (run on the annotated output from step 1)
+python reallocate_capofila.py data/report_annotated.xlsx
+# Custom output path (default: data/report_capofila.xlsx):
+python reallocate_capofila.py data/report_annotated.xlsx --out data/capofila_out.xlsx
+
+# Step 3: Build final post-reallocation report
+python build_post_report.py data/report_capofila.xlsx data/updated_report.csv data/extra.csv --annullo-from 2026-05-01
+# Custom output path (default: data/post_report.xlsx):
+python build_post_report.py data/report_capofila.xlsx data/updated_report.csv data/extra.csv --annullo-from 2026-05-01 --out data/final.xlsx
 ```
 
-`reallocate.py` must be run from the project root (`c:\dev\seat-reallocator\`). It reads the raw report CSV, auto-detects problematic orders, and writes the annotated full report to `data/report_annotated.xlsx`.
+All scripts must be run from the project root (`c:\dev\seat-reallocator\`).
 
-There are no tests and no linter configuration.
+## Installing dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+## Running tests
+
+```bash
+python -m pytest tests/ -v
+```
 
 ## Architecture
 
-The algorithm lives in the `seat_reallocator/` package. `reallocate.py` is a thin entry point. See [ARCHITECTURE.md](ARCHITECTURE.md) for a full walkthrough.
+All domain logic lives in the `seat_reallocator/` package. Entry-point scripts at the root are thin shells. See [ARCHITECTURE.md](ARCHITECTURE.md) for a full walkthrough.
 
 ```
 seat_reallocator/
     config.py       all constants and tuning parameters
-    io.py           CSV loading, orders-file parsing
+    io.py           load_csv, load_tickets, parse_orders
     geometry.py     contiguous_runs, is_adjacent, pair_seats
     seats.py        resolve_seats, build_segments
-    engine.py       process_event, detect_collateral
-    reporter.py     write_reallocation_report, write_full_report
-    cli.py          main() + argparse
+    engine.py       detect_non_consecutive_orders, process_event, detect_collateral
+    capofila.py     build_occupied_current, fix_capofila_orders (chain-shift)
+    reporter.py     write_full_report
+    post_report.py  build (DF1 + DF2 + DF3 merge), main()
+    cli.py          main() for reallocate.py
+    exporter.py     export_swap_files
     solver/
         base.py     SegmentSolver ABC
         ilp.py      ILPSolver (primary — pulp/CBC)
@@ -62,9 +83,11 @@ Falls back to `BacktrackSolver` if `pulp` is unavailable or the ILP finds no sol
 
 Greedy warm-start + branch-and-bound, `MAX_BRANCHES = 25` per level, `BT_TIME_LIMIT = 1.0 s` budget. Minimises `(collateral, displacement)` lexicographically.
 
-### Output
+### Capofila pass
 
-One sheet per event date (colon→dot, slash→dash in sheet name), plus an optional `COLLATERALE` sheet.
+Capofila orders (those whose `Settore prezzi` contains `'capofila'`) have a fixed L/R aisle structure the ILP cannot resolve. `capofila.py` uses a chain-shift approach: for 3-seat orders, it tries relay, primary cascade, and secondary cascade strategies in ascending cost order.
+
+### Output status values
 
 | `Stato` value | Meaning |
 |---|---|

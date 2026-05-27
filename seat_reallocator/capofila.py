@@ -271,12 +271,12 @@ def _execute_shift_chain(
 
 def fix_capofila_orders(
     event_df: pd.DataFrame,
-    infeasible_ids: list,
+    order_ids: list,
     occupied: dict,
     event_date: str,
 ) -> tuple:
     """
-    Post-process NON RISOLVIBILE Capofila orders via in-row chain shift.
+    Fix non-consecutive Capofila orders via in-row chain shift.
 
     occupied must be built with build_occupied_current() so that keys reflect
     the actual current seat positions (Nuovo posto after any prior reallocation).
@@ -293,7 +293,7 @@ def fix_capofila_orders(
     occupied_local         = dict(occupied)
     sides_cache            = _detect_sides(event_df)
 
-    for oid in infeasible_ids:
+    for oid in order_ids:
         oid_str = str(oid)
 
         order_rows = event_df[
