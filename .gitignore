@@ -1,6 +1,6 @@
 *.csv
 *.xlsx
-*.txt
+orders.txt
 
 __pycache__/
 data/
