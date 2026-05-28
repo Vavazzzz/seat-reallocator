@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Seat Reallocator</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #f1f5f9;
+      color: #1e293b;
+      min-height: 100vh;
+      padding: 32px 16px;
+    }
+
+    .container { max-width: 620px; margin: 0 auto; }
+
+    h1 {
+      font-size: 1.375rem;
+      font-weight: 700;
+      letter-spacing: -0.01em;
+      margin-bottom: 6px;
+    }
+    .subtitle {
+      font-size: 0.875rem;
+      color: #64748b;
+      margin-bottom: 28px;
+    }
+
+    .card {
+      background: #fff;
+      border: 1px solid #e2e8f0;
+      border-radius: 10px;
+      padding: 20px 22px;
+      margin-bottom: 14px;
+    }
+    .card-title {
+      font-size: 0.8125rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: #94a3b8;
+      margin-bottom: 14px;
+    }
+
+    /* Tab selector */
+    .tabs {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 6px;
+      margin-bottom: 0;
+    }
+    .tab-btn {
+      background: #f8fafc;
+      border: 1px solid #e2e8f0;
+      border-radius: 6px;
+      padding: 8px 4px;
+      font-size: 0.75rem;
+      font-weight: 500;
+      color: #64748b;
+      cursor: pointer;
+      text-align: center;
+      line-height: 1.3;
+      transition: all 0.15s;
+    }
+    .tab-btn:hover { background: #f0f4f8; border-color: #cbd5e1; color: #334155; }
+    .tab-btn.active {
+      background: #1d4ed8;
+      border-color: #1d4ed8;
+      color: #fff;
+    }
+    .tab-step {
+      display: block;
+      font-size: 0.6875rem;
+      opacity: 0.75;
+      margin-bottom: 2px;
+    }
+
+    /* Form fields */
+    .field { margin-bottom: 14px; }
+    .field:last-child { margin-bottom: 0; }
+    .field label {
+      display: flex;
+      align-items: baseline;
+      gap: 6px;
+      font-size: 0.875rem;
+      font-weight: 500;
+      color: #334155;
+      margin-bottom: 5px;
+    }
+    .badge {
+      font-size: 0.6875rem;
+      font-weight: 400;
+      padding: 1px 6px;
+      border-radius: 99px;
+      background: #f1f5f9;
+      color: #94a3b8;
+      border: 1px solid #e2e8f0;
+    }
+    .badge.required {
+      background: #fef2f2;
+      color: #dc2626;
+      border-color: #fecaca;
+    }
+    .field-hint {
+      font-size: 0.75rem;
+      color: #94a3b8;
+      margin-bottom: 5px;
+    }
+
+    input[type="file"], input[type="date"] {
+      width: 100%;
+      font-size: 0.875rem;
+      color: #334155;
+      border: 1px solid #cbd5e1;
+      border-radius: 6px;
+      padding: 7px 10px;
+      background: #fff;
+      transition: border-color 0.15s;
+    }
+    input[type="file"]:focus, input[type="date"]:focus {
+      outline: none;
+      border-color: #3b82f6;
+      box-shadow: 0 0 0 3px rgba(59,130,246,.12);
+    }
+    input[type="file"]::file-selector-button {
+      background: #f8fafc;
+      border: 1px solid #cbd5e1;
+      border-radius: 4px;
+      padding: 3px 10px;
+      font-size: 0.8125rem;
+      cursor: pointer;
+      margin-right: 8px;
+      color: #475569;
+    }
+    input[type="file"]::file-selector-button:hover {
+      background: #f1f5f9;
+    }
+
+    .form-section { display: none; }
+    .form-section.active { display: block; }
+
+    /* Description box */
+    .desc {
+      font-size: 0.8125rem;
+      color: #64748b;
+      background: #f8fafc;
+      border: 1px solid #e2e8f0;
+      border-radius: 6px;
+      padding: 10px 12px;
+      margin-bottom: 14px;
+      line-height: 1.5;
+    }
+    .desc strong { color: #334155; }
+
+    /* Submit button */
+    .btn-primary {
+      width: 100%;
+      background: #2563eb;
+      color: #fff;
+      border: none;
+      border-radius: 7px;
+      padding: 11px 20px;
+      font-size: 0.9375rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+    .btn-primary:hover:not(:disabled) { background: #1d4ed8; }
+    .btn-primary:disabled { background: #93c5fd; cursor: not-allowed; }
+
+    /* Status / result area */
+    #status-area { margin-top: 14px; }
+
+    .status-box {
+      border-radius: 8px;
+      padding: 14px 16px;
+      font-size: 0.875rem;
+      line-height: 1.5;
+    }
+    .status-box.pending {
+      background: #fefce8;
+      border: 1px solid #fde047;
+      color: #713f12;
+    }
+    .status-box.complete {
+      background: #f0fdf4;
+      border: 1px solid #86efac;
+      color: #14532d;
+    }
+    .status-box.error {
+      background: #fef2f2;
+      border: 1px solid #fca5a5;
+      color: #7f1d1d;
+    }
+
+    .spinner {
+      display: inline-block;
+      width: 14px; height: 14px;
+      border: 2px solid #fde047;
+      border-top-color: #713f12;
+      border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+      vertical-align: middle;
+      margin-right: 6px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .btn-download {
+      display: inline-block;
+      margin-top: 10px;
+      background: #059669;
+      color: #fff;
+      text-decoration: none;
+      padding: 9px 18px;
+      border-radius: 6px;
+      font-size: 0.875rem;
+      font-weight: 600;
+      transition: background 0.15s;
+    }
+    .btn-download:hover { background: #047857; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Seat Reallocator</h1>
+    <p class="subtitle">Genera report di riallocazione posti per eventi concertistici</p>
+
+    <!-- Report type selector -->
+    <div class="card">
+      <div class="card-title">Tipo di Report</div>
+      <div class="tabs">
+        <button class="tab-btn active" onclick="selectTab('reallocation')">
+          <span class="tab-step">Step 1</span>Riallocazione
+        </button>
+        <button class="tab-btn" onclick="selectTab('capofila')">
+          <span class="tab-step">Step 2</span>Capofila
+        </button>
+        <button class="tab-btn" onclick="selectTab('post')">
+          <span class="tab-step">Step 3</span>Post-Report
+        </button>
+        <button class="tab-btn" onclick="selectTab('swap')">
+          <span class="tab-step">Extra</span>Riallocazioni
+        </button>
+      </div>
+    </div>
+
+    <!-- Step 1: Reallocation -->
+    <div class="card form-section active" id="section-reallocation">
+      <div class="card-title">Step 1 — Riallocazione Standard</div>
+      <div class="desc">
+        Riceve il CSV grezzo del report. Rileva ordini non consecutivi e trova la
+        disposizione ottimale. Produce <strong>report_annotated.xlsx</strong>.
+      </div>
+      <div class="field">
+        <label>Report CSV <span class="badge required">richiesto</span></label>
+        <input type="file" id="f-report-csv" accept=".csv">
+      </div>
+      <div class="field">
+        <label>Orders TXT <span class="badge">opzionale</span></label>
+        <div class="field-hint">Sovrascrive il rilevamento automatico degli ordini non consecutivi</div>
+        <input type="file" id="f-orders-txt" accept=".txt">
+      </div>
+    </div>
+
+    <!-- Step 2: Capofila -->
+    <div class="card form-section" id="section-capofila">
+      <div class="card-title">Step 2 — Correzione Posti Corsie Capofila</div>
+      <div class="desc">
+        Riceve l'output dello step 1. Applica la logica chain-shift per gli ordini
+        capofila (posti corsia L/R). Produce <strong>report_capofila.xlsx</strong>.
+      </div>
+      <div class="field">
+        <label>Report annotato XLSX <span class="badge required">richiesto</span></label>
+        <div class="field-hint">Output dello step 1 (report_annotated.xlsx)</div>
+        <input type="file" id="f-annotated-cap" accept=".xlsx">
+      </div>
+    </div>
+
+    <!-- Step 3: Post-Report -->
+    <div class="card form-section" id="section-post">
+      <div class="card-title">Step 3 — Report Post-Riallocazione</div>
+      <div class="desc">
+        Unisce il report annotato (DF1) con il CSV aggiornato (DF2) e i dati supplementari
+        (DF3). Filtra per data annullo. Produce <strong>post_report.xlsx</strong>.
+      </div>
+      <div class="field">
+        <label>Report annotato XLSX <span class="badge required">DF1 — richiesto</span></label>
+        <div class="field-hint">Output step 1 o step 2</div>
+        <input type="file" id="f-annotated-post" accept=".xlsx">
+      </div>
+      <div class="field">
+        <label>Report CSV aggiornato <span class="badge required">DF2 — richiesto</span></label>
+        <input type="file" id="f-updated-csv" accept=".csv">
+      </div>
+      <div class="field">
+        <label>Dati supplementari CSV <span class="badge required">DF3 — richiesto</span></label>
+        <input type="file" id="f-extra-csv" accept=".csv">
+      </div>
+      <div class="field">
+        <label>Data annullo da <span class="badge required">richiesto</span></label>
+        <div class="field-hint">Mantieni solo le righe con "data annullo" successiva a questa data</div>
+        <input type="date" id="f-annullo-from">
+      </div>
+    </div>
+
+    <!-- Extra: Swap / Reallocation report -->
+    <div class="card form-section" id="section-swap">
+      <div class="card-title">Extra — Report Riallocazioni (Swap)</div>
+      <div class="desc">
+        Trasforma un file annotato in un report per-posto con mappatura
+        vecchio→nuovo ordine. Produce <strong>swap_report.xlsx</strong>.
+      </div>
+      <div class="field">
+        <label>Source XLSX <span class="badge required">richiesto</span></label>
+        <div class="field-hint">Output di qualsiasi step (report_annotated.xlsx o report_capofila.xlsx)</div>
+        <input type="file" id="f-source-xlsx" accept=".xlsx">
+      </div>
+    </div>
+
+    <button class="btn-primary" id="generate-btn" onclick="generate()">
+      Genera Report
+    </button>
+
+    <div id="status-area"></div>
+  </div>
+
+  <script>
+    let currentTab = 'reallocation';
+    let pollTimer = null;
+
+    function selectTab(tab) {
+      currentTab = tab;
+      document.querySelectorAll('.tab-btn').forEach((btn, i) => {
+        const tabs = ['reallocation', 'capofila', 'post', 'swap'];
+        btn.classList.toggle('active', tabs[i] === tab);
+      });
+      document.querySelectorAll('.form-section').forEach(s => {
+        s.classList.toggle('active', s.id === 'section-' + tab);
+      });
+      clearStatus();
+    }
+
+    function clearStatus() {
+      if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+      document.getElementById('status-area').innerHTML = '';
+    }
+
+    function setStatus(html, cls) {
+      document.getElementById('status-area').innerHTML =
+        `<div class="status-box ${cls}">${html}</div>`;
+    }
+
+    function setBtn(disabled) {
+      document.getElementById('generate-btn').disabled = disabled;
+    }
+
+    async function generate() {
+      clearStatus();
+      setBtn(true);
+
+      const fd = new FormData();
+      fd.append('report_type', currentTab);
+
+      // Validate and collect files
+      if (currentTab === 'reallocation') {
+        const csv = document.getElementById('f-report-csv').files[0];
+        if (!csv) { setStatus('Selezionare il file CSV del report.', 'error'); setBtn(false); return; }
+        fd.append('report_csv', csv);
+        const orders = document.getElementById('f-orders-txt').files[0];
+        if (orders) fd.append('orders_txt', orders);
+
+      } else if (currentTab === 'capofila') {
+        const f = document.getElementById('f-annotated-cap').files[0];
+        if (!f) { setStatus('Selezionare il file XLSX annotato.', 'error'); setBtn(false); return; }
+        fd.append('annotated_xlsx', f);
+
+      } else if (currentTab === 'post') {
+        const ann = document.getElementById('f-annotated-post').files[0];
+        const upd = document.getElementById('f-updated-csv').files[0];
+        const ext = document.getElementById('f-extra-csv').files[0];
+        const date = document.getElementById('f-annullo-from').value;
+        if (!ann || !upd || !ext || !date) {
+          setStatus('Compilare tutti i campi obbligatori.', 'error');
+          setBtn(false); return;
+        }
+        fd.append('annotated_xlsx', ann);
+        fd.append('updated_csv', upd);
+        fd.append('extra_csv', ext);
+        fd.append('annullo_from', date);
+
+      } else if (currentTab === 'swap') {
+        const f = document.getElementById('f-source-xlsx').files[0];
+        if (!f) { setStatus('Selezionare il file XLSX sorgente.', 'error'); setBtn(false); return; }
+        fd.append('source_xlsx', f);
+      }
+
+      setStatus('<span class="spinner"></span>Caricamento file in corso...', 'pending');
+
+      let jobId;
+      try {
+        const res = await fetch('/api/generate', { method: 'POST', body: fd });
+        const data = await res.json();
+        if (!res.ok || data.error) {
+          setStatus('Errore: ' + (data.error || 'Richiesta non valida'), 'error');
+          setBtn(false); return;
+        }
+        jobId = data.job_id;
+      } catch (e) {
+        setStatus('Errore di rete: ' + e.message, 'error');
+        setBtn(false); return;
+      }
+
+      setStatus('<span class="spinner"></span>Elaborazione in corso&hellip; (può richiedere fino a 1 minuto)', 'pending');
+
+      pollTimer = setInterval(async () => {
+        try {
+          const sr = await fetch('/api/status/' + jobId);
+          const sd = await sr.json();
+
+          if (sd.status === 'complete') {
+            clearInterval(pollTimer); pollTimer = null;
+            setBtn(false);
+            setStatus(
+              'Report generato con successo.<br>' +
+              `<a class="btn-download" href="/api/download/${jobId}">Scarica Report</a>`,
+              'complete'
+            );
+          } else if (sd.status === 'error') {
+            clearInterval(pollTimer); pollTimer = null;
+            setBtn(false);
+            setStatus('Errore durante l\'elaborazione:<br><strong>' + escHtml(sd.error || 'Errore sconosciuto') + '</strong>', 'error');
+          }
+        } catch (_) {
+          clearInterval(pollTimer); pollTimer = null;
+          setBtn(false);
+          setStatus('Errore di rete durante il controllo dello stato.', 'error');
+        }
+      }, 2000);
+    }
+
+    function escHtml(s) {
+      return String(s)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+  </script>
+</body>
+</html>
