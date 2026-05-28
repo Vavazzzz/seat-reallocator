@@ -6,6 +6,7 @@ import tempfile
 import threading
 import time
 import uuid
+import zipfile
 from pathlib import Path
 
 from flask import Flask, jsonify, render_template, request, send_file
@@ -185,6 +186,30 @@ def _run_swap_report(job_id: str, temp_dir: str, xlsx_path: str) -> None:
         _set_job(job_id, status='error', error=_exc_message(exc))
 
 
+def _run_export_pubblici(job_id: str, temp_dir: str, xlsx_path: str) -> None:
+    try:
+        from seat_reallocator.exporter import export_swap_files
+
+        out_dir = Path(temp_dir) / 'export'
+        files_written = export_swap_files(Path(xlsx_path), out_dir)
+
+        if not files_written:
+            _set_job(job_id, status='error', error='Nessun ordine SPOSTATO trovato nel file.')
+            return
+
+        zip_path = os.path.join(temp_dir, 'export_pubblici.zip')
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for f in files_written:
+                zf.write(f, Path(f).name)
+
+        _set_job(job_id, status='complete', output_path=zip_path)
+        logger.info('Export-pubblici job %s complete (%d files)', job_id, len(files_written))
+
+    except BaseException as exc:
+        logger.exception('Export-pubblici job %s failed', job_id)
+        _set_job(job_id, status='error', error=_exc_message(exc))
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -243,6 +268,12 @@ def generate():
             return _abort('Selezionare il file XLSX sorgente.')
         target, args = _run_swap_report, (job_id, temp_dir, xlsx_path)
 
+    elif report_type == 'export_pubblici':
+        xlsx_path = _save('source_xlsx', 'source')
+        if not xlsx_path:
+            return _abort('Selezionare il file XLSX sorgente.')
+        target, args = _run_export_pubblici, (job_id, temp_dir, xlsx_path)
+
     else:
         return _abort('Tipo di report non valido.')
 
@@ -290,12 +321,19 @@ def download(job_id: str):
     with _jobs_lock:
         _jobs.pop(job_id, None)
 
+    ext = Path(filename).suffix.lower()
+    mimetype = (
+        'application/zip'
+        if ext == '.zip'
+        else 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    )
+
     data.seek(0)
     return send_file(
         data,
         as_attachment=True,
         download_name=filename,
-        mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        mimetype=mimetype,
     )
 
 

@@ -48,7 +48,7 @@
     /* Tab selector */
     .tabs {
       display: grid;
-      grid-template-columns: repeat(4, 1fr);
+      grid-template-columns: repeat(5, 1fr);
       gap: 6px;
       margin-bottom: 0;
     }
@@ -244,6 +244,9 @@
         <button class="tab-btn" onclick="selectTab('swap')">
           <span class="tab-step">Extra</span>Riallocazioni
         </button>
+        <button class="tab-btn" onclick="selectTab('export_pubblici')">
+          <span class="tab-step">Extra</span>Export Pubblici
+        </button>
       </div>
     </div>
 
@@ -320,6 +323,21 @@
       </div>
     </div>
 
+    <!-- Extra: Export Pubblici -->
+    <div class="card form-section" id="section-export_pubblici">
+      <div class="card-title">Extra — Export Pubblici</div>
+      <div class="desc">
+        Genera file per-evento per-numero-biglietti con tutti i dati degli ordini
+        spostati (vecchio/nuovo posto, barcode, nominativi). Scarica uno <strong>ZIP</strong>
+        contenente un file per ogni combinazione evento × n° biglietti.
+      </div>
+      <div class="field">
+        <label>Source XLSX <span class="badge required">richiesto</span></label>
+        <div class="field-hint">Output di qualsiasi step (report_annotated.xlsx o report_capofila.xlsx)</div>
+        <input type="file" id="f-export-xlsx" accept=".xlsx">
+      </div>
+    </div>
+
     <button class="btn-primary" id="generate-btn" onclick="generate()">
       Genera Report
     </button>
@@ -334,7 +352,7 @@
     function selectTab(tab) {
       currentTab = tab;
       document.querySelectorAll('.tab-btn').forEach((btn, i) => {
-        const tabs = ['reallocation', 'capofila', 'post', 'swap'];
+        const tabs = ['reallocation', 'capofila', 'post', 'swap', 'export_pubblici'];
         btn.classList.toggle('active', tabs[i] === tab);
       });
       document.querySelectorAll('.form-section').forEach(s => {
@@ -393,6 +411,11 @@
 
       } else if (currentTab === 'swap') {
         const f = document.getElementById('f-source-xlsx').files[0];
+        if (!f) { setStatus('Selezionare il file XLSX sorgente.', 'error'); setBtn(false); return; }
+        fd.append('source_xlsx', f);
+
+      } else if (currentTab === 'export_pubblici') {
+        const f = document.getElementById('f-export-xlsx').files[0];
         if (!f) { setStatus('Selezionare il file XLSX sorgente.', 'error'); setBtn(false); return; }
         fd.append('source_xlsx', f);
       }
