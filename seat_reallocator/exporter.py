@@ -22,11 +22,13 @@ def pivot_order(group: pd.DataFrame) -> dict:
     group = group.sort_values('Posto').reset_index(drop=True)
     first = group.iloc[0]
 
+    email = _safe(first.get('Email', ''))
     row: dict = {
-        'ordine':  _safe(first.get('Codice ordine', '')),
-        'cognome': _safe(first.get('Cognome', '')),
-        'nome':    _safe(first.get('Nome', '')),
-        'email':   _safe(first.get('Email', '')),
+        'ordine':          _safe(first.get('Codice ordine', '')),
+        'cognome':         _safe(first.get('Cognome', '')),
+        'nome':            _safe(first.get('Nome', '')),
+        'email':           email,
+        'SubscriberKey':   f'746-{email}' if email else '',
     }
 
     for i, (_, tix) in enumerate(group.iterrows(), start=1):
@@ -103,9 +105,9 @@ def export_swap_files(input_path: Path, output_dir: Path) -> list:
 
         for n_tix, wide_df in sorted(buckets.items()):
             label    = f'{n_tix}_ticket' + ('s' if n_tix != 1 else '')
-            fname    = f'{sheet}_{label}.xlsx'
+            fname    = f'{sheet}_{label}.csv'
             out_path = output_dir / fname
-            wide_df.to_excel(out_path, index=False)
+            wide_df.to_csv(out_path, index=False)
             files_written.append(out_path)
             print(f'  [{sheet}] {n_tix} ticket(s): {len(wide_df)} orders -> {out_path}')
 
