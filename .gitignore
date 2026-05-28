@@ -4,3 +4,5 @@ orders.txt
 
 __pycache__/
 data/
+build/
+dist/
