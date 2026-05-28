@@ -26,6 +26,17 @@ def parse_orders(path: str) -> dict:
     return result
 
 
+def _parse_fila(val):
+    """Convert Fila: numeric string → int, non-numeric non-null string (e.g. "-") → str, null → None."""
+    if pd.isna(val):
+        return None
+    s = str(val).strip()
+    try:
+        return int(float(s))
+    except (ValueError, TypeError):
+        return s if s else None
+
+
 def load_tickets(path: str) -> pd.DataFrame:
     if path.lower().endswith(('.xlsx', '.xls')):
         sheets = pd.read_excel(
@@ -39,8 +50,7 @@ def load_tickets(path: str) -> pd.DataFrame:
     df = df[df['Fila'].astype(str).str.upper() != 'GA']
     df = df[df['Stato posto'].isin(VALID)].copy()
     df['Posto'] = pd.to_numeric(df['Posto'], errors='coerce')
-    df['Fila']  = pd.to_numeric(df['Fila'],  errors='coerce')
+    df['Fila']  = df['Fila'].apply(_parse_fila)
     df = df.dropna(subset=['Posto', 'Fila', 'Data evento', 'Settore', 'Settore prezzi'])
     df['Posto'] = df['Posto'].astype(int)
-    df['Fila']  = df['Fila'].astype(int)
     return df
