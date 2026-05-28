@@ -107,7 +107,7 @@ def export_swap_files(input_path: Path, output_dir: Path) -> list:
             label    = f'{n_tix}_ticket' + ('s' if n_tix != 1 else '')
             fname    = f'{sheet}_{label}.csv'
             out_path = output_dir / fname
-            wide_df.to_csv(out_path, index=False)
+            wide_df.to_csv(out_path, index=False, sep=';')
             files_written.append(out_path)
             print(f'  [{sheet}] {n_tix} ticket(s): {len(wide_df)} orders -> {out_path}')
 
