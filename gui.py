@@ -55,13 +55,14 @@ class App(ctk.CTk):
         self.tabs = ctk.CTkTabview(self, height=280)
         self.tabs.pack(fill='x', padx=24, pady=(16, 0))
 
-        for name in ('Riallocazione', 'Capofila', 'Post-Report', 'Riallocazioni', 'Export Pubblici'):
+        for name in ('Riallocazione', 'Capofila', 'Post-Report', 'Riallocazioni', 'Riallocazioni 2', 'Export Pubblici'):
             self.tabs.add(name)
 
         self._v_rall  = self._tab_reallocation()
         self._v_cap   = self._tab_capofila()
         self._v_post  = self._tab_post()
         self._v_swap  = self._tab_swap()
+        self._v_rall2 = self._tab_reallocation_report()
         self._v_exp   = self._tab_export()
 
         # Generate button
@@ -157,6 +158,12 @@ class App(ctk.CTk):
         xlsx = self._file_row(t, 'Source XLSX', [('Excel', '*.xlsx')])
         return {'xlsx': xlsx}
 
+    def _tab_reallocation_report(self):
+        t = self.tabs.tab('Riallocazioni 2')
+        self._hint(t, 'Extra — Report per-posto con ordine, nomi e stato; produce reallocation_report.xlsx')
+        xlsx = self._file_row(t, 'Source XLSX', [('Excel', '*.xlsx')])
+        return {'xlsx': xlsx}
+
     def _tab_export(self):
         t = self.tabs.tab('Export Pubblici')
         self._hint(t, 'Extra — File per-evento × n° biglietti; produce uno ZIP con tutti i file')
@@ -204,6 +211,8 @@ class App(ctk.CTk):
             }
         if tab == 'Riallocazioni':
             return {'xlsx': req(self._v_swap['xlsx'], 'Source XLSX')}
+        if tab == 'Riallocazioni 2':
+            return {'xlsx': req(self._v_rall2['xlsx'], 'Source XLSX')}
         if tab == 'Export Pubblici':
             return {'xlsx': req(self._v_exp['xlsx'], 'Source XLSX')}
         raise ValueError(f'Tab sconosciuto: {tab}')
@@ -224,6 +233,7 @@ class App(ctk.CTk):
         if tab == 'Capofila':         return self._do_capofila(args, temp_dir)
         if tab == 'Post-Report':      return self._do_post(args, temp_dir)
         if tab == 'Riallocazioni':    return self._do_swap(args, temp_dir)
+        if tab == 'Riallocazioni 2':  return self._do_rall2(args, temp_dir)
         if tab == 'Export Pubblici':  return self._do_export(args, temp_dir)
 
     # ── Business logic ───────────────────────────────────────────────────
@@ -303,6 +313,12 @@ class App(ctk.CTk):
         from seat_reallocator.reallocations_report import build
         out = os.path.join(temp_dir, 'swap_report.xlsx')
         build(args['xlsx'], out)
+        return out
+
+    def _do_rall2(self, args, temp_dir):
+        from seat_reallocator.reallocation_report import build_reallocation_report
+        out = os.path.join(temp_dir, 'reallocation_report.xlsx')
+        build_reallocation_report(Path(args['xlsx']), Path(out))
         return out
 
     def _do_export(self, args, temp_dir):

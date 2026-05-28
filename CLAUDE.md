@@ -20,7 +20,12 @@ python reallocate_capofila.py data/report_annotated.xlsx
 # Custom output path (default: data/report_capofila.xlsx):
 python reallocate_capofila.py data/report_annotated.xlsx --out data/capofila_out.xlsx
 
-# Step 3: Build final post-reallocation report
+# Step 3: Build flat reallocation report (one row per affected seat)
+python build_reallocation_report.py data/report_capofila.xlsx
+# Custom output path (default: data/reallocation_report.xlsx):
+python build_reallocation_report.py data/report_capofila.xlsx --out data/my_realloc_report.xlsx
+
+# Step 4: Build final post-reallocation report
 python build_post_report.py data/report_capofila.xlsx data/updated_report.csv data/extra.csv --annullo-from 2026-05-01
 # Custom output path (default: data/post_report.xlsx):
 python build_post_report.py data/report_capofila.xlsx data/updated_report.csv data/extra.csv --annullo-from 2026-05-01 --out data/final.xlsx

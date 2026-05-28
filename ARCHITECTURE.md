@@ -20,12 +20,13 @@ The key insight driving decomposition is unchanged: a seat in `(Settore B, Row 7
 ### Three-script workflow
 
 ```
-1. reallocate.py           Standard reallocation pass (ILP / backtrack solver)
-2. reallocate_capofila.py  Capofila-specific pass using chain-shift (run on output of step 1)
-3. build_post_report.py    Joins annotated output with updated ticket data for final report
+1. reallocate.py                Standard reallocation pass (ILP / backtrack solver)
+2. reallocate_capofila.py       Capofila-specific pass using chain-shift (run on output of step 1)
+3. build_reallocation_report.py Flat per-seat report from annotated output (Codice ordine, names, seat cols, Stato)
+4. build_post_report.py         Joins annotated output with updated ticket data for final report
 ```
 
-Steps 1 and 2 both produce an annotated `.xlsx`; step 3 consumes that output together with a fresh ticket export.
+Steps 1 and 2 both produce an annotated `.xlsx`; step 3 reads that output and emits a focused reallocation summary; step 4 consumes the annotated output together with a fresh ticket export.
 
 ### Main execution flow (reallocate.py)
 
