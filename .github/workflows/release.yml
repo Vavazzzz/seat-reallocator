@@ -1,0 +1,43 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\pip\Cache
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Build with PyInstaller
+        run: pyinstaller seat_reallocator.spec
+
+      - name: Package
+        run: Compress-Archive -Path dist\SeatReallocator -DestinationPath SeatReallocator-${{ github.ref_name }}-windows.zip
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: SeatReallocator-${{ github.ref_name }}-windows.zip
+          generate_release_notes: true
