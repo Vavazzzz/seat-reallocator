@@ -1,7 +1,7 @@
 import pandas as pd
 
-from .config import OCCUPIED
-from .io import load_csv
+from ..config import OCCUPIED
+from ..io import load_csv
 
 _MOVE_COLS = [
     'Codice ordine', 'Settore', 'Fila', 'Settore prezzi',

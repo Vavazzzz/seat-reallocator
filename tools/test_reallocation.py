@@ -23,7 +23,7 @@ from seat_reallocator.config import OCCUPIED
 from seat_reallocator.io import load_tickets
 from seat_reallocator.engine import detect_non_consecutive_orders
 from seat_reallocator.engine import process_event, detect_collateral
-from seat_reallocator.reporter import write_full_report
+from seat_reallocator.reports.annotator import write_full_report
 
 
 def run_reallocation(csv_path: str, out_path: str) -> None:

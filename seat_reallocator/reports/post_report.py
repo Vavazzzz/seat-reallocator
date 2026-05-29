@@ -14,7 +14,7 @@ import sys
 
 import pandas as pd
 
-from .io import load_csv
+from ..io import load_csv
 
 _REALLOC_STATES = {'SPOSTATO', 'COINVOLTO'}
 _DEFAULT_OUT = 'data/post_report.xlsx'

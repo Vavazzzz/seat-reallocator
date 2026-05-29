@@ -12,7 +12,7 @@ Defaults:
 import sys
 from pathlib import Path
 
-from seat_reallocator.exporter import export_swap_files
+from seat_reallocator.reports.exporter import export_swap_files
 
 INPUT_DEFAULT  = Path('data/report_annotated.xlsx')
 OUTPUT_DEFAULT = Path('swap_output')

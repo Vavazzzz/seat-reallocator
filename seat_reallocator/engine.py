@@ -3,7 +3,7 @@ from collections import defaultdict
 import pandas as pd
 
 from .geometry import is_adjacent
-from .seats import resolve_seats, build_segments
+from .segments import resolve_seats, build_segments
 from .solver import solve_segment
 
 

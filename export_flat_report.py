@@ -2,7 +2,7 @@
 import argparse
 from pathlib import Path
 
-from seat_reallocator.reallocation_report import build_reallocation_report
+from seat_reallocator.reports.flat_report import build_reallocation_report
 
 _DEFAULT_OUT = 'data/reallocation_report.xlsx'
 

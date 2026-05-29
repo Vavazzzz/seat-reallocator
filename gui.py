@@ -244,7 +244,7 @@ class App(ctk.CTk):
             detect_collateral, detect_non_consecutive_orders, process_event,
         )
         from seat_reallocator.io import load_tickets, parse_orders
-        from seat_reallocator.reporter import write_full_report
+        from seat_reallocator.reports.annotator import write_full_report
 
         out = os.path.join(temp_dir, 'report_annotated.xlsx')
         tickets = load_tickets(args['csv'])
@@ -273,7 +273,7 @@ class App(ctk.CTk):
         from seat_reallocator.capofila import build_occupied_current, fix_capofila_orders
         from seat_reallocator.engine import detect_non_consecutive_orders
         from seat_reallocator.io import load_tickets
-        from seat_reallocator.reporter import write_full_report
+        from seat_reallocator.reports.annotator import write_full_report
 
         out = os.path.join(temp_dir, 'report_capofila.xlsx')
         tickets = load_tickets(args['xlsx'])
@@ -304,25 +304,25 @@ class App(ctk.CTk):
         return out
 
     def _do_post(self, args, temp_dir):
-        from seat_reallocator.post_report import build
+        from seat_reallocator.reports.post_report import build
         out = os.path.join(temp_dir, 'post_report.xlsx')
         build(args['ann'], args['upd'], args['ext'], args['date'], out)
         return out
 
     def _do_swap(self, args, temp_dir):
-        from seat_reallocator.reallocations_report import build
+        from seat_reallocator.reports.swap_map import build
         out = os.path.join(temp_dir, 'swap_report.xlsx')
         build(args['xlsx'], out)
         return out
 
     def _do_rall2(self, args, temp_dir):
-        from seat_reallocator.reallocation_report import build_reallocation_report
+        from seat_reallocator.reports.flat_report import build_reallocation_report
         out = os.path.join(temp_dir, 'reallocation_report.xlsx')
         build_reallocation_report(Path(args['xlsx']), Path(out))
         return out
 
     def _do_export(self, args, temp_dir):
-        from seat_reallocator.exporter import export_swap_files
+        from seat_reallocator.reports.exporter import export_swap_files
         out_dir = Path(temp_dir) / 'export'
         files = export_swap_files(Path(args['xlsx']), out_dir)
         if not files:

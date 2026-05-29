@@ -17,13 +17,16 @@ The primary solver is an **Integer Linear Program (ILP)** that jointly optimises
 
 The key insight driving decomposition is unchanged: a seat in `(Settore B, Row 7, price PRIMO)` can only be swapped with another seat in the exact same `(Settore, Fila, Settore prezzi)` triple. Every such triple is an independent 1-D sub-problem, solved separately.
 
-### Three-script workflow
+### Workflow scripts
 
 ```
-1. reallocate.py                Standard reallocation pass (ILP / backtrack solver)
-2. reallocate_capofila.py       Capofila-specific pass using chain-shift (run on output of step 1)
-3. build_reallocation_report.py Flat per-seat report from annotated output (Codice ordine, names, seat cols, Stato)
-4. build_post_report.py         Joins annotated output with updated ticket data for final report
+reallocate.py          Step 1 — Standard reallocation pass (ILP / backtrack solver)
+reallocate_capofila.py Step 2 — Capofila chain-shift pass (run on output of step 1)
+export_flat_report.py  Step 3 — Flat per-seat report (Codice ordine, names, seat cols, Stato)
+export_post_report.py  Step 4 — DF1+DF2+DF3 merge with updated ticket data
+export_swap_map.py     Extra  — Per-seat physical swap map (old order → new order)
+export_swap.py         Extra  — Per-order public cards (wide format, one file per event)
+gui.py                 Desktop GUI wrapping all of the above
 ```
 
 Steps 1 and 2 both produce an annotated `.xlsx`; step 3 reads that output and emits a focused reallocation summary; step 4 consumes the annotated output together with a fresh ticket export.
@@ -59,27 +62,37 @@ write_full_report()         → annotated xlsx (one sheet per event)
 
 ```
 seat_reallocator/
-    __init__.py         package marker
-    config.py           all constants and tuning parameters
-    io.py               CSV/Excel loading and orders-file parsing
-    geometry.py         pure 1-D geometry helpers (no I/O, no pandas)
-    seats.py            seat-state resolution and segment partitioning
-    engine.py           per-event orchestration, detection, collateral
-    capofila.py         chain-shift fixer for Capofila aisle orders
-    reporter.py         Excel output (write_full_report)
-    post_report.py      post-reallocation report builder (DF1 + DF2 + DF3)
-    cli.py              CLI entry point for reallocate.py
-    exporter.py         per-order swap-file exporter
+    __init__.py             package marker
+    config.py               all constants and tuning parameters
+    io.py                   CSV/Excel loading and orders-file parsing
+    geometry.py             pure 1-D geometry helpers (no I/O, no pandas)
+    segments.py             seat-state resolution and segment partitioning
+    engine.py               per-event orchestration, detection, collateral
+    capofila.py             chain-shift fixer for Capofila aisle orders
+    cli.py                  CLI entry point for reallocate.py
     solver/
-        __init__.py     public solve_segment() entry point
-        base.py         SegmentSolver abstract base class
-        backtrack.py    BacktrackSolver — greedy warm-start + branch-and-bound
-        ilp.py          ILPSolver — primary ILP solver (delegates to BT on failure)
+        __init__.py         public solve_segment() entry point
+        base.py             SegmentSolver abstract base class
+        backtrack.py        BacktrackSolver — greedy warm-start + branch-and-bound
+        ilp.py              ILPSolver — primary ILP solver (delegates to BT on failure)
+    reports/
+        __init__.py         package marker
+        annotator.py        annotate source file with move outcomes (write_full_report)
+        flat_report.py      flat per-seat summary (build_reallocation_report)
+        swap_map.py         per-seat physical swap map: old order → new order (build)
+        post_report.py      DF1+DF2+DF3 merge report (build, main)
+        exporter.py         per-order public cards, wide format (export_swap_files)
 
-reallocate.py           thin shell → seat_reallocator.cli.main()
-reallocate_capofila.py  thin shell → capofila workflow
-build_post_report.py    thin shell → seat_reallocator.post_report.main()
-export_swap.py          thin shell → seat_reallocator.exporter.export_swap_files()
+reallocate.py               thin shell → seat_reallocator.cli.main()
+reallocate_capofila.py      thin shell → capofila workflow
+export_flat_report.py       thin shell → seat_reallocator.reports.flat_report
+export_post_report.py       thin shell → seat_reallocator.reports.post_report.main()
+export_swap_map.py          thin shell → seat_reallocator.reports.swap_map.main()
+export_swap.py              thin shell → seat_reallocator.reports.exporter.export_swap_files()
+gui.py                      desktop GUI (customtkinter)
+tools/
+    test_detection.py       CLI: compare detect_non_consecutive_orders vs reference output
+    test_reallocation.py    CLI: run full pipeline and diff against reference xlsx
 ```
 
 ---
@@ -130,7 +143,7 @@ other part of the package.
 
 ---
 
-### `seats.py`
+### `segments.py`
 
 **Public interface**: `resolve_seats(event_df)`, `build_segments(occupied, free)`
 
@@ -183,17 +196,36 @@ the standard ILP solver cannot fix; instead a chain-shift approach is used.
 
 ---
 
-### `reporter.py`
+### `annotator.py`
 
 **Public interface**: `write_full_report(source_path, all_moves, infeasible_set, collateral_rows, path=...)`
 
-All Excel output in one place.
+Reads the full source file again, left-merges the move DataFrame on
+`(Data evento, Codice ordine, posto_num)`, annotates every row with `Nuovo posto`
+and `Stato`, drops temp columns, reorders so the new columns follow `Posto`,
+writes one sheet per event. Returns the annotated DataFrame for stat reporting.
 
-- `write_full_report` — reads the full source file again, left-merges the move
-  DataFrame on `(Data evento, Codice ordine, posto_num)`, annotates every row
-  with `Nuovo posto` and `Stato`, drops temp columns, reorders so the new columns
-  follow `Posto`, writes one sheet per event. Returns the annotated DataFrame
-  for stat reporting in the CLI.
+---
+
+### `flat_report.py`
+
+**Public interface**: `build_reallocation_report(input_path, output_path)`
+
+Reads all event sheets from an annotated xlsx, drops `NON COINVOLTO` rows,
+selects a fixed column subset (`Codice ordine`, `Cognome`, `Nome`, `Settore`,
+`Fila`, `Posto`, `Nuovo posto`, `Stato`, `Settore prezzi`, participant names),
+and writes a single sorted sheet. Returns the row count written.
+
+---
+
+### `swap_map.py`
+
+**Public interface**: `build(source_path, out_path)`, `main()`
+
+Builds a per-seat physical swap map from an annotated xlsx: for each physical
+seat touched by a `SPOSTATO` move, emits one row with the old occupant and the
+new occupant side by side. Keyed on `(Settore, Fila, Posto)` — useful for
+venue staff who need to know what changed at each seat position.
 
 ---
 
@@ -304,7 +336,7 @@ cli.py
   ├── io.py              (load_tickets, parse_orders)
   ├── engine.py          (detect_non_consecutive_orders, process_event, detect_collateral)
   │     ├── geometry.py  (is_adjacent)
-  │     ├── seats.py     (resolve_seats, build_segments)
+  │     ├── segments.py  (resolve_seats, build_segments)
   │     │     └── config.py
   │     └── solver/
   │           ├── __init__.py   → ILPSolver
@@ -314,19 +346,19 @@ cli.py
   │           └── backtrack.py
   │                 ├── geometry.py
   │                 └── config.py
-  └── reporter.py        (write_full_report)
-        ├── io.py        (load_csv)
-        └── config.py    (OCCUPIED)
+  └── reports/annotator.py  (write_full_report)
+        ├── io.py            (load_csv)
+        └── config.py        (OCCUPIED)
 
 reallocate_capofila.py
-  ├── io.py              (load_tickets)
-  ├── engine.py          (detect_non_consecutive_orders)
-  ├── capofila.py        (build_occupied_current, fix_capofila_orders)
-  │     └── config.py   (OCCUPIED)
-  └── reporter.py        (write_full_report)
+  ├── io.py                  (load_tickets)
+  ├── engine.py              (detect_non_consecutive_orders)
+  ├── capofila.py            (build_occupied_current, fix_capofila_orders)
+  │     └── config.py       (OCCUPIED)
+  └── reports/annotator.py  (write_full_report)
 
-post_report.py
-  └── io.py              (load_csv)
+reports/post_report.py
+  └── io.py                  (load_csv)
 ```
 
 External dependencies: `pandas`, `openpyxl`, `pulp` (optional — graceful fallback), `numpy`.
@@ -374,7 +406,7 @@ the optional `Selezione in mappa` column (rows with value `'true'` are excluded)
 
 ---
 
-### `resolve_seats(event_df)` — `seats.py`
+### `resolve_seats(event_df)` — `segments.py`
 
 **Output**: `occupied: {(settore, fila, posto): (order_id, sp)}`, `free: {(settore, fila, posto): sp}`
 
@@ -383,7 +415,7 @@ CANCELLED rows for the same seat.
 
 ---
 
-### `build_segments(occupied, free)` — `seats.py`
+### `build_segments(occupied, free)` — `segments.py`
 
 **Output**: `{(settore, fila, sp): {'seats': {posto: order_id}, 'free': set[posto]}}`
 
@@ -436,7 +468,7 @@ assignment, then flags any order that was adjacent before but non-adjacent after
 
 ---
 
-### `write_full_report(source_path, all_moves, infeasible_set, collateral_rows, path)` — `reporter.py`
+### `write_full_report(source_path, all_moves, infeasible_set, collateral_rows, path)` — `annotator.py`
 
 Re-reads the source file, left-merges the move DataFrame on
 `(Data evento, Codice ordine, posto_num)`, annotates each row with `Nuovo posto`

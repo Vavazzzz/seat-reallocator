@@ -1,6 +1,6 @@
 import pandas as pd
 
-from seat_reallocator.exporter import pivot_order, process_sheet
+from seat_reallocator.reports.exporter import pivot_order, process_sheet
 
 
 # ---------------------------------------------------------------------------

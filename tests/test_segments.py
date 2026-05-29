@@ -1,6 +1,6 @@
 import pandas as pd
 
-from seat_reallocator.seats import resolve_seats, build_segments
+from seat_reallocator.segments import resolve_seats, build_segments
 
 
 def _df(rows):

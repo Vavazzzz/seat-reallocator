@@ -21,14 +21,19 @@ python reallocate_capofila.py data/report_annotated.xlsx
 python reallocate_capofila.py data/report_annotated.xlsx --out data/capofila_out.xlsx
 
 # Step 3: Build flat reallocation report (one row per affected seat)
-python build_reallocation_report.py data/report_capofila.xlsx
+python export_flat_report.py data/report_capofila.xlsx
 # Custom output path (default: data/reallocation_report.xlsx):
-python build_reallocation_report.py data/report_capofila.xlsx --out data/my_realloc_report.xlsx
+python export_flat_report.py data/report_capofila.xlsx --out data/my_realloc_report.xlsx
 
 # Step 4: Build final post-reallocation report
-python build_post_report.py data/report_capofila.xlsx data/updated_report.csv data/extra.csv --annullo-from 2026-05-01
+python export_post_report.py data/report_capofila.xlsx data/updated_report.csv data/extra.csv --annullo-from 2026-05-01
 # Custom output path (default: data/post_report.xlsx):
-python build_post_report.py data/report_capofila.xlsx data/updated_report.csv data/extra.csv --annullo-from 2026-05-01 --out data/final.xlsx
+python export_post_report.py data/report_capofila.xlsx data/updated_report.csv data/extra.csv --annullo-from 2026-05-01 --out data/final.xlsx
+
+# Extra: per-seat physical swap map (old order → new order, by seat position)
+python export_swap_map.py data/report_capofila.xlsx
+# Custom output path (default: data/swap_report.xlsx):
+python export_swap_map.py data/report_capofila.xlsx --out data/my_swap_map.xlsx
 ```
 
 All scripts must be run from the project root (`c:\dev\seat-reallocator\`).
@@ -51,20 +56,23 @@ All domain logic lives in the `seat_reallocator/` package. Entry-point scripts a
 
 ```
 seat_reallocator/
-    config.py       all constants and tuning parameters
-    io.py           load_csv, load_tickets, parse_orders
-    geometry.py     contiguous_runs, is_adjacent, pair_seats
-    seats.py        resolve_seats, build_segments
-    engine.py       detect_non_consecutive_orders, process_event, detect_collateral
-    capofila.py     build_occupied_current, fix_capofila_orders (chain-shift)
-    reporter.py     write_full_report
-    post_report.py  build (DF1 + DF2 + DF3 merge), main()
-    cli.py          main() for reallocate.py
-    exporter.py     export_swap_files
+    config.py           all constants and tuning parameters
+    io.py               load_csv, load_tickets, parse_orders
+    geometry.py         contiguous_runs, is_adjacent, pair_seats
+    segments.py         resolve_seats, build_segments
+    engine.py           detect_non_consecutive_orders, process_event, detect_collateral
+    capofila.py         build_occupied_current, fix_capofila_orders (chain-shift)
+    cli.py              main() for reallocate.py
     solver/
-        base.py     SegmentSolver ABC
-        ilp.py      ILPSolver (primary — pulp/CBC)
-        backtrack.py BacktrackSolver (fallback)
+        base.py         SegmentSolver ABC
+        ilp.py          ILPSolver (primary — pulp/CBC)
+        backtrack.py    BacktrackSolver (fallback)
+    reports/
+        annotator.py    write_full_report (annotates source file with move outcomes)
+        flat_report.py  build_reallocation_report (flat per-seat list)
+        swap_map.py     build (per-seat physical swap map: old order → new order)
+        post_report.py  build (DF1 + DF2 + DF3 merge), main()
+        exporter.py     export_swap_files (per-order public cards)
 ```
 
 ### Problem
