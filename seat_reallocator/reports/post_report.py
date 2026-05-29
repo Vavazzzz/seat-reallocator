@@ -70,7 +70,7 @@ def build(
     try:
         cutoff = pd.Timestamp(annullo_from)
     except Exception:
-        sys.exit(f'Invalid --annullo-from date: {annullo_from!r}. Use YYYY-MM-DD.')
+        sys.exit(f'Invalid --annullo-from date: {annullo_from!r}. Use YYYY-MM-DD or "YYYY-MM-DD HH:MM".')
     if 'data annullo' not in merged.columns:
         sys.exit("DF2 is missing the 'data annullo' column.")
     merged['data annullo'] = pd.to_datetime(merged['data annullo'], errors='coerce')
@@ -102,7 +102,7 @@ def main() -> None:
     parser.add_argument('extra', help='Supplementary data CSV (DF3)')
     parser.add_argument(
         '--annullo-from', metavar='DATE', required=True,
-        help='Keep only rows where "data annullo" > DATE (format: YYYY-MM-DD)',
+        help='Keep only rows where "data annullo" > DATE (e.g. 2026-05-01 or "2026-05-01 14:30")',
     )
     parser.add_argument(
         '--out', metavar='PATH', default=_DEFAULT_OUT,
