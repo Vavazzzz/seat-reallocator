@@ -1,29 +1,34 @@
 #!/usr/bin/env python3
-"""
-Transform report_annotated.xlsx into per-event, per-ticket-count swap files.
-
-Usage:
-    python export_swap.py [input.xlsx] [output_dir]
-
-Defaults:
-    input      : data/report_annotated.xlsx
-    output_dir : swap_output/
-"""
-import sys
+import argparse
 from pathlib import Path
 
 from seat_reallocator.reports.exporter import export_swap_files
 
-INPUT_DEFAULT  = Path('data/report_annotated.xlsx')
-OUTPUT_DEFAULT = Path('swap_output')
+_DEFAULT_INPUT  = 'data/report_annotated.xlsx'
+_DEFAULT_OUTPUT = 'swap_output'
 
-if __name__ == '__main__':
-    args = sys.argv[1:]
-    inp  = Path(args[0]) if len(args) >= 1 else INPUT_DEFAULT
-    out  = Path(args[1]) if len(args) >= 2 else OUTPUT_DEFAULT
 
+def main():
+    parser = argparse.ArgumentParser(
+        description='Export per-order public swap cards from an annotated xlsx',
+    )
+    parser.add_argument(
+        'input', nargs='?', default=_DEFAULT_INPUT,
+        help=f'Annotated xlsx (default: {_DEFAULT_INPUT})',
+    )
+    parser.add_argument(
+        '--out', metavar='DIR', default=_DEFAULT_OUTPUT,
+        help=f'Output directory (default: {_DEFAULT_OUTPUT})',
+    )
+    args = parser.parse_args()
+
+    inp = Path(args.input)
     if not inp.exists():
-        sys.exit(f'Input file not found: {inp}')
+        parser.error(f'Input file not found: {inp}')
 
     print(f'Reading {inp} …')
-    export_swap_files(inp, out)
+    export_swap_files(inp, Path(args.out))
+
+
+if __name__ == '__main__':
+    main()

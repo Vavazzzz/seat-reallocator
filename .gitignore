@@ -2,7 +2,13 @@
 *.xlsx
 orders.txt
 
+# Python
 __pycache__/
+.venv/
+.pytest_cache/
+
+# Project output
 data/
+swap_output/
 build/
 dist/

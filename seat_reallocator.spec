@@ -1,5 +1,8 @@
 # PyInstaller spec for Seat Reallocator desktop app
 # Build with: pyinstaller seat_reallocator.spec
+#
+# After any refactor that moves modules (e.g. into a new sub-package), verify
+# that all lazy imports inside gui.py still resolve before rebuilding.
 
 import sys
 from pathlib import Path
