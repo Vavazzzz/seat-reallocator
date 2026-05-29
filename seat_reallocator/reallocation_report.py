@@ -14,6 +14,7 @@ REPORT_COLS = [
     'Posto',
     'Nuovo posto',
     'Stato',
+    'Settore prezzi',
     'Nome partecipante',
     'Cognome partecipante',
 ]
@@ -53,6 +54,10 @@ def build_reallocation_report(input_path: Path, output_path: Path) -> int:
             big_df[c] = ''
 
     report = big_df[REPORT_COLS].copy()
+    report = report.sort_values(
+        ['Settore', 'Fila', 'Posto'],
+        key=lambda s: pd.to_numeric(s, errors='coerce').fillna(s) if s.name in ('Fila', 'Posto') else s,
+    ).reset_index(drop=True)
 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)

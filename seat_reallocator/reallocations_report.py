@@ -63,10 +63,12 @@ def build(source_path: str, out_path: str = _DEFAULT_OUT) -> None:
             for (settore, fila, posto) in all_seats:
                 old_row = old_lookup.get((settore, fila, posto))
                 new_row = new_lookup.get((settore, fila, posto))
+                sp = _get(old_row, 'Settore prezzi') or _get(new_row, 'Settore prezzi')
                 records.append({
                     'Settore': settore,
                     'Fila': fila,
                     'Posto': int(posto),
+                    'Settore prezzi': sp,
                     'Vecchio ordine': _get(old_row, 'Codice ordine'),
                     'Vecchio nome partecipante': _get(old_row, 'Nome partecipante'),
                     'Vecchio cognome partecipante': _get(old_row, 'Cognome partecipante'),
@@ -75,9 +77,11 @@ def build(source_path: str, out_path: str = _DEFAULT_OUT) -> None:
                     'Nuovo cognome partecipante': _get(new_row, 'Cognome partecipante'),
                 })
 
-            pd.DataFrame(records).to_excel(
-                writer, sheet_name=_sheet_name(raw_name), index=False
-            )
+            out_df = pd.DataFrame(records).sort_values(
+                ['Settore', 'Fila', 'Posto'],
+                key=lambda s: pd.to_numeric(s, errors='coerce').fillna(s) if s.name in ('Fila', 'Posto') else s,
+            ).reset_index(drop=True)
+            out_df.to_excel(writer, sheet_name=_sheet_name(raw_name), index=False)
 
 
 def main() -> None:
