@@ -45,8 +45,9 @@ def pivot_order(group: pd.DataFrame) -> dict:
         row[f'vecchio_posto_{n}']   = _safe(tix.get('Posto', ''))
         row[f'nuovo_settore_{n}']   = _safe(tix.get('Settore prezzi', ''))
         row[f'nuovo_blocco_{n}']    = _safe(tix.get('Settore', ''))
-        row[f'nuova_fila_{n}']      = _safe(tix.get('Fila', ''))
-        row[f'nuovo_posto_{n}']     = _safe(nuovo_posto)
+        is_ga = str(tix.get('Fila', '')).strip().upper() == 'GA'
+        row[f'nuova_fila_{n}']      = '-' if is_ga else _safe(tix.get('Fila', ''))
+        row[f'nuovo_posto_{n}']     = '-' if is_ga else _safe(nuovo_posto)
 
     return row
 
