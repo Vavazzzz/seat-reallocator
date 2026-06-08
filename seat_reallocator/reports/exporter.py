@@ -33,7 +33,8 @@ def pivot_order(group: pd.DataFrame) -> dict:
 
     for i, (_, tix) in enumerate(group.iterrows(), start=1):
         n = f'{i:02d}'
-        moved      = str(tix.get('Stato', '')).strip().upper() == 'SPOSTATO'
+        moved       = str(tix.get('Stato', '')).strip().upper() == 'SPOSTATO'
+        is_ga       = str(tix.get('Fila', '')).strip().upper() == 'GA'
         nuovo_posto = tix.get('Nuovo posto') if moved else tix.get('Posto')
 
         row[f'cognome_{n}']         = _safe(tix.get('Cognome partecipante', ''))
@@ -41,11 +42,10 @@ def pivot_order(group: pd.DataFrame) -> dict:
         row[f'barcode_{n}']         = _safe(tix.get('Codice supporto', ''))
         row[f'vecchio_settore_{n}'] = _safe(tix.get('Settore prezzi', ''))
         row[f'vecchio_blocco_{n}']  = _safe(tix.get('Settore', ''))
-        row[f'vecchia_fila_{n}']    = _safe(tix.get('Fila', ''))
-        row[f'vecchio_posto_{n}']   = _safe(tix.get('Posto', ''))
+        row[f'vecchia_fila_{n}']    = '-' if is_ga else _safe(tix.get('Fila', ''))
+        row[f'vecchio_posto_{n}']   = '-' if is_ga else _safe(tix.get('Posto', ''))
         row[f'nuovo_settore_{n}']   = _safe(tix.get('Settore prezzi', ''))
         row[f'nuovo_blocco_{n}']    = _safe(tix.get('Settore', ''))
-        is_ga = str(tix.get('Fila', '')).strip().upper() == 'GA'
         row[f'nuova_fila_{n}']      = '-' if is_ga else _safe(tix.get('Fila', ''))
         row[f'nuovo_posto_{n}']     = '-' if is_ga else _safe(nuovo_posto)
 
